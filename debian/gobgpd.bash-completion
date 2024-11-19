@@ -1,0 +1,3 @@
+tools/completion/gobgp-completion.bash gobgp
+tools/completion/gobgp-dynamic-completion.bash
+tools/completion/gobgp-static-completion.bash

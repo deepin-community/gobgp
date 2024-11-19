@@ -1,0 +1,5 @@
+Test-Command: gobgp --help
+Depends: gobgpd
+
+Test-Command: gobgpd & sleep 1 && gobgp global as 65000 router-id 1.1.1.1 listen-port 5179 && gobgp global
+Depends: gobgpd

@@ -1,0 +1,2 @@
+usr/bin/gobgp*
+tools/completion/zsh/_gobgp usr/share/zsh/vendor-completions

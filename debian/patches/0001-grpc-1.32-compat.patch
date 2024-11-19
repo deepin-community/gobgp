@@ -1,0 +1,29 @@
+From: Shengjing Zhu <zhsj@debian.org>
+Date: Thu, 22 Dec 2022 23:59:52 +0800
+Subject: grpc 1.32 compat
+
+---
+ cmd/gobgp/common.go | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/cmd/gobgp/common.go b/cmd/gobgp/common.go
+index 4d9b311..f5cd8c5 100644
+--- a/cmd/gobgp/common.go
++++ b/cmd/gobgp/common.go
+@@ -33,7 +33,6 @@ import (
+ 
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/credentials"
+-	"google.golang.org/grpc/credentials/insecure"
+ 
+ 	api "github.com/osrg/gobgp/v3/api"
+ 	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
+@@ -303,7 +302,7 @@ func newClient(ctx context.Context) (api.GobgpApiClient, context.CancelFunc, err
+ 		creds = credentials.NewTLS(tlsConfig)
+ 		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(creds))
+ 	} else {
+-		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
++		grpcOpts = append(grpcOpts, grpc.WithInsecure())
+ 	}
+ 
+ 	target := globalOpts.Target

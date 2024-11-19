@@ -1,0 +1,16 @@
+[Unit]
+Description=GoBGP Routing Daemon
+Documentation=file:/usr/share/doc/gobgpd/getting-started.md
+After=network.target syslog.service
+ConditionPathExists=/etc/gobgpd.conf
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/gobgpd -f /etc/gobgpd.conf -d
+ExecStart=/usr/bin/gobgpd -f /etc/gobgpd.conf --sdnotify --disable-stdlog --syslog yes $GOBGPD_OPTIONS
+ExecReload=/usr/bin/gobgpd -r
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+From: Mathias Gibbens <gibmat@debian.org>
+Description: Skip test that has a high failure rate (see #1078512)
+Forwarded: https://github.com/osrg/gobgp/issues/2851
+diff --git a/pkg/server/server_test.go b/pkg/server/server_test.go
+index bb6c5db..0bd1261 100644
+--- a/pkg/server/server_test.go
++++ b/pkg/server/server_test.go
+@@ -2168,6 +2168,7 @@ func TestListPathWithIdentifiers(t *testing.T) {
+ }
+ 
+ func TestWatchEvent(test *testing.T) {
++	test.Skip("Skipping test; see #1078512")
+ 	assert := assert.New(test)
+ 	s := NewBgpServer()
+ 	go s.Serve()
