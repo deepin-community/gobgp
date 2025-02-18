@@ -22,7 +22,7 @@ License: Apache-2.0
 Files: debian/*
 Copyright:
  Copyright 2016-2022 Vincent Bernat <bernat@debian.org>
- Copyright 2022-2024 Mathias Gibbens
+ Copyright 2022-2025 Mathias Gibbens
 License: Apache-2.0
 Comment: Debian packaging is licensed under the same terms as upstream
 

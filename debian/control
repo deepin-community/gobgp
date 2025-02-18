@@ -33,7 +33,8 @@ Build-Depends: bash-completion,
                golang-gopkg-eapache-channels.v1-dev,
                protobuf-compiler (>= 3.20.0),
                protoc-gen-go,
-               protoc-gen-go-grpc (>= 1.33.3)
+               protoc-gen-go-grpc (>= 1.33.3),
+               help2man
 Build-Conflicts: golang-github-golang-protobuf-1-3-dev
 Standards-Version: 4.7.0
 Rules-Requires-Root: no

@@ -1,3 +1,19 @@
+gobgp (3.33.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * d/rules:
+    - Auto-generate manpages
+    - Only include single .md file required for test in -dev package
+  * Update years in d/copyright
+
+ -- Mathias Gibbens <gibmat@debian.org>  Sat, 11 Jan 2025 16:04:21 +0000
+
+gobgp (3.32.0-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Mathias Gibbens <gibmat@debian.org>  Thu, 05 Dec 2024 00:09:25 +0000
+
 gobgp (3.31.0-1) unstable; urgency=medium
 
   * New upstream release
