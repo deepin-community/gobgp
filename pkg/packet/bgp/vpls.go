@@ -27,7 +27,6 @@ import (
 //
 // [RFC 4761, section 3.2.2]: https://www.rfc-editor.org/rfc/rfc4761.html#section-3.2.2.
 type VPLSNLRI struct {
-	PrefixDefault
 	VEID           uint16
 	VEBlockOffset  uint16
 	VEBlockSize    uint16
@@ -36,7 +35,7 @@ type VPLSNLRI struct {
 	rd RouteDistinguisherInterface
 }
 
-func (n *VPLSNLRI) DecodeFromBytes(data []byte, options ...*MarshallingOption) error {
+func (n *VPLSNLRI) decodeFromBytes(data []byte, options ...*MarshallingOption) error {
 	/*
 		RFC6074 Section 7 BGP-AD and VPLS-BGP Interoperability
 		Both BGP-AD and VPLS-BGP [RFC4761] use the same AFI/SAFI.  In order
@@ -48,13 +47,19 @@ func (n *VPLSNLRI) DecodeFromBytes(data []byte, options ...*MarshallingOption) e
 		NLRI length.  Therefore, implementations of BGP-AD must ignore NLRI
 		that are greater than 12 bytes.
 	*/
-	length := int(binary.BigEndian.Uint16(data[0:2]))
+	if len(data) < 2 {
+		return NewMessageError(BGP_ERROR_UPDATE_MESSAGE_ERROR, BGP_ERROR_SUB_MALFORMED_ATTRIBUTE_LIST, nil, "Not all VPLS NLRI bytes available")
+	}
+	length := int(binary.BigEndian.Uint16(data[:2]))
 	if len(data) < length+2 {
 		return NewMessageError(BGP_ERROR_UPDATE_MESSAGE_ERROR, BGP_ERROR_SUB_MALFORMED_ATTRIBUTE_LIST, nil, "Not all VPLS NLRI bytes available")
 	}
 	if length == 12 { // BGP-AD
 		// BGP-AD is not supported yet
 		return nil
+	}
+	if len(data) < 19 {
+		return NewMessageError(BGP_ERROR_UPDATE_MESSAGE_ERROR, BGP_ERROR_SUB_MALFORMED_ATTRIBUTE_LIST, nil, "Not all VPLS NLRI bytes available")
 	}
 	// VPLS-BGP
 	n.rd = GetRouteDistinguisher(data[2:10])
@@ -72,7 +77,7 @@ func (n *VPLSNLRI) Serialize(options ...*MarshallingOption) ([]byte, error) {
 	buf := make([]byte, 16)
 	labelBaseBuf := make([]byte, 3)
 
-	binary.BigEndian.PutUint16(buf[0:2], 17)
+	binary.BigEndian.PutUint16(buf[:2], 17)
 	rdbuf, err := n.rd.Serialize()
 	if err != nil {
 		return nil, err
@@ -83,18 +88,10 @@ func (n *VPLSNLRI) Serialize(options ...*MarshallingOption) ([]byte, error) {
 	binary.BigEndian.PutUint16(buf[14:16], n.VEBlockSize)
 
 	labelBlockBase := n.LabelBlockBase << 4
-	labelBaseBuf[0] = byte((labelBlockBase >> 16) & 0xff)
-	labelBaseBuf[1] = byte((labelBlockBase >> 8) & 0xff)
+	labelBaseBuf[0] = byte(labelBlockBase >> 16 & 0xff)
+	labelBaseBuf[1] = byte(labelBlockBase >> 8 & 0xff)
 	labelBaseBuf[2] = byte(labelBlockBase & 0xff)
 	return append(buf, labelBaseBuf...), nil
-}
-
-func (n *VPLSNLRI) AFI() uint16 {
-	return AFI_L2VPN
-}
-
-func (n *VPLSNLRI) SAFI() uint8 {
-	return SAFI_VPLS
 }
 
 func (n *VPLSNLRI) Len(options ...*MarshallingOption) int {
@@ -168,7 +165,7 @@ func (e *VPLSExtended) Serialize() ([]byte, error) {
 	buf[0] = byte(EC_TYPE_GENERIC_TRANSITIVE_EXPERIMENTAL)
 	buf[1] = byte(EC_SUBTYPE_L2_INFO)
 	buf[2] = byte(LAYER2ENCAPSULATION_TYPE_VPLS)
-	buf[3] = byte(e.ControlFlags)
+	buf[3] = e.ControlFlags
 	binary.BigEndian.PutUint16(buf[4:6], e.MTU)
 	// 6-8: reserved, but Juniper says this is "site preference"
 	return buf, nil

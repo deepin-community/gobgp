@@ -1,3 +1,72 @@
+gobgp (4.4.0-1) unstable; urgency=medium
+
+  * New upstream release:
+    - Includes fixes for CVE-2026-5122, CVE-2026-5123, CVE-2026-5124
+      (Closes: #1132653)
+    - Drop patch applied upstream
+    - Add patch to fix display of gobgpd help message, which should hopefully
+      make the build reproducible
+  * d/control:
+    - Update Standards-Version to 4.7.4 (no changes needed)
+    - Update Build-Depends and Depends
+
+ -- Mathias Gibbens <gibmat@debian.org>  Sun, 05 Apr 2026 16:29:53 +0000
+
+gobgp (4.3.0-1) unstable; urgency=medium
+
+  * New upstream release:
+    - Includes fixes for the following security issues:
+      * CVE-2025-7464 (Closes: #1109300)
+      * CVE-2026-30405 (Closes: #1131115)
+    - Drop d/p/0001-grpc-1.32-compat.patch
+  * d/control:
+    - Update Standards-Version to 4.7.3, drop Priority field
+    - Update Build-Depends and Depends
+    - Update Breaks for incus
+    - Drop redundant Rules-Requires-Root
+  * Update proto generation in d/rules
+  * Update years in d/copyright
+
+ -- Mathias Gibbens <gibmat@debian.org>  Thu, 26 Mar 2026 18:48:40 +0000
+
+gobgp (3.36.0-2) unstable; urgency=medium
+
+  * Add back Built-Using stanza in d/control
+
+ -- Mathias Gibbens <gibmat@debian.org>  Sun, 27 Apr 2025 15:14:00 +0000
+
+gobgp (3.36.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * Replace Built-Using with Static-Built-Using in d/control
+
+ -- Mathias Gibbens <gibmat@debian.org>  Sat, 05 Apr 2025 14:10:23 +0000
+
+gobgp (3.35.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * d/control:
+    - Update Standards-Version to 4.7.2 (no changes needed)
+    - Update Build-Depends and Depends
+
+ -- Mathias Gibbens <gibmat@debian.org>  Tue, 04 Mar 2025 13:44:10 +0000
+
+gobgp (3.33.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * d/rules:
+    - Auto-generate manpages
+    - Only include single .md file required for test in -dev package
+  * Update years in d/copyright
+
+ -- Mathias Gibbens <gibmat@debian.org>  Sat, 11 Jan 2025 16:04:21 +0000
+
+gobgp (3.32.0-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Mathias Gibbens <gibmat@debian.org>  Thu, 05 Dec 2024 00:09:25 +0000
+
 gobgp (3.31.0-1) unstable; urgency=medium
 
   * New upstream release

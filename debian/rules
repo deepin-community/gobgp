@@ -1,14 +1,22 @@
 #!/usr/bin/make -f
 
+include /usr/share/dpkg/pkg-info.mk
+
 # Don't build an example binary
 export DH_GOLANG_EXCLUDES := github.com/osrg/gobgp/tools/config
-export DH_GOLANG_INSTALL_EXTRA = docs/sources
+
+# Needed for a test
+export DH_GOLANG_INSTALL_EXTRA = docs/sources/configuration.md
 
 %:
-	dh $@ --buildsystem=golang --with=golang,bash-completion
-
-PB_GO_FILES = $(patsubst %.proto, %.pb.go, $(wildcard api/*.proto))
+	dh $@ --builddirectory=_build --buildsystem=golang --with=golang,bash-completion
 
 execute_before_dh_auto_configure:
-	protoc -Iapi/ --go_out=api --go_opt=paths=source_relative \
-		--go-grpc_out=api --go-grpc_opt=paths=source_relative $(PB_GO_FILES:.pb.go=.proto)
+	cd proto/ && protoc --go_out=../ --go_opt=paths=source_relative \
+		--go-grpc_out=../ --go-grpc_opt=paths=source_relative api/*.proto
+
+execute_after_dh_auto_build:
+	# Generate the man pages
+	mkdir man1/
+	TZ=UTC HOME="~" help2man _build/bin/gobgp -n "GoBGP CLI client" --no-info --no-discard-stderr --version-string=$(DEB_VERSION_UPSTREAM) > man1/gobgp.1
+	TZ=UTC HOME="~" help2man _build/bin/gobgpd -n "GoBGP daemon" --no-info --no-discard-stderr --version-string=$(DEB_VERSION_UPSTREAM) > man1/gobgpd.1

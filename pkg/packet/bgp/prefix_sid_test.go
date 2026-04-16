@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"net/netip"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestRoundTripSubSubTLV(t *testing.T) {
@@ -124,4 +126,89 @@ func TestNewPathAttributePrefixSID(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSRv6L3ServiceUnknownSubTLV(t *testing.T) {
+	// SRv6L3ServiceAttribute with an unknown sub-TLV type (0xff).
+	// Previously, the default branch advanced the wrong variable (data
+	// instead of stlvs), causing an infinite loop.
+	input := []byte{
+		0x05,       // Type: TLVTypeSRv6L3Service
+		0x00, 0x07, // Length: 7 (1 reserved + 6 sub-TLV)
+		0x00, // Reserved
+		// Unknown sub-TLV: Type=0xff, Length=3, Value=0x01,0x02,0x03
+		0xff, 0x00, 0x03, 0x01, 0x02, 0x03,
+	}
+	s := &SRv6L3ServiceAttribute{}
+	err := s.DecodeFromBytes(input)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, len(s.SubTLVs))
+}
+
+func TestSRv6ServiceTLVUnknownSubTLV(t *testing.T) {
+	// SRv6ServiceTLV with an unknown sub-TLV type (0xff).
+	// Same bug as SRv6L3ServiceAttribute.
+	input := []byte{
+		0x05,       // Type: TLVTypeSRv6L3Service
+		0x00, 0x07, // Length: 7 (1 reserved + 6 sub-TLV)
+		0x00, // Reserved
+		// Unknown sub-TLV: Type=0xff, Length=3, Value=0x01,0x02,0x03
+		0xff, 0x00, 0x03, 0x01, 0x02, 0x03,
+	}
+	s := &SRv6ServiceTLV{}
+	err := s.DecodeFromBytes(input)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, len(s.SubTLVs))
+}
+
+// to make label with bottom of stack
+type prefixSidLabel struct {
+	Label uint32
+	IPAddrPrefixDefault
+}
+
+func (l *prefixSidLabel) Serialize(options ...*MarshallingOption) ([]byte, error) {
+	bits := 8*3 + l.Prefix.Bits()
+	buf := []byte{byte(bits)}
+	label := l.Label << 4
+	lbuf := []byte{byte(label >> 16 & 0xff), byte(label >> 8 & 0xff), byte(label & 0xff)}
+	buf = append(buf, lbuf...)
+	buf = append(buf, l.serializePrefix()...)
+	return buf, nil
+}
+
+func (l *prefixSidLabel) Flat() map[string]string {
+	return map[string]string{}
+}
+
+func (l *prefixSidLabel) MarshalJSON() ([]byte, error) {
+	return []byte{}, nil
+}
+
+func (l *prefixSidLabel) Len(options ...*MarshallingOption) int {
+	return 0
+}
+
+func (l *prefixSidLabel) String() string {
+	return ""
+}
+
+func TestLabelBottomWorkaround(t *testing.T) {
+	assert := assert.New(t)
+	label := uint32(16000)
+	prefix := &prefixSidLabel{Label: label, IPAddrPrefixDefault: IPAddrPrefixDefault{Prefix: netip.MustParsePrefix("200.10.10.0/24")}}
+	mpreach, _ := NewPathAttributeMpReachNLRI(RF_IPv4_MPLS, []PathNLRI{{NLRI: prefix}}, netip.MustParseAddr("4.4.4.4"))
+
+	sid := NewPathAttributePrefixSID()
+
+	binary, err := NewBGPUpdateMessage(nil, []PathAttributeInterface{mpreach, sid}, nil).Serialize()
+	assert.NoError(err)
+
+	msg, err := ParseBGPMessage(binary)
+	assert.NoError(err)
+
+	mpreach = msg.Body.(*BGPUpdate).PathAttributes[0].(*PathAttributeMpReachNLRI)
+	assert.Equal(1, len(mpreach.Value))
+	p := mpreach.Value[0].NLRI.(*LabeledIPAddrPrefix)
+	assert.Equal(label, p.Labels.Labels[0])
 }

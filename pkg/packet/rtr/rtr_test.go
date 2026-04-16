@@ -18,7 +18,7 @@ package rtr
 import (
 	"encoding/hex"
 	"math/rand"
-	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -82,8 +82,7 @@ var rtrIPPrefixTestCases = []rtrIPPrefixTestCase{
 func Test_RTRIPPrefix(t *testing.T) {
 	for i := range rtrIPPrefixTestCases {
 		test := &rtrIPPrefixTestCases[i]
-		addr := net.ParseIP(test.pString)
-		verifyRTRMessage(t, NewRTRIPPrefix(addr, test.pLen, test.mLen, test.asn, test.flags))
+		verifyRTRMessage(t, NewRTRIPPrefix(netip.MustParseAddr(test.pString), test.pLen, test.mLen, test.asn, test.flags))
 	}
 }
 
@@ -116,9 +115,51 @@ func Test_RTRErrorReport(t *testing.T) {
 	verifyRTRMessage(t, NewRTRErrorReport(CORRUPT_DATA, errPDU, errText2))
 }
 
-func FuzzParseRTR(f *testing.F) {
+func Test_ParseRTR_ErrorReportRejectsOversizedTextLen(t *testing.T) {
+	// Regression for OSS-Fuzz OOM: RTRErrorReport.DecodeFromBytes used TextLen
+	// from the input without validating against available bytes, causing huge
+	// allocations.
+	//
+	// Build a minimal ErrorReport with PDULen=0 and an absurd TextLen, while the
+	// buffer itself is tiny.
+	data := make([]byte, 21)
+	data[0] = 0
+	data[1] = RTR_ERROR_REPORT
+	// ErrorCode (2 bytes) left as 0
+	// Len (4 bytes) = 21
+	putUint32BE(data[4:8], uint32(len(data)))
+	// PDULen (4 bytes) = 0
+	putUint32BE(data[8:12], 0)
+	// TextLen (4 bytes) = very large
+	putUint32BE(data[12:16], 0xfffffff0)
 
+	_, err := ParseRTR(data)
+	require.Error(t, err)
+}
+
+func putUint32BE(b []byte, v uint32) {
+	b[0] = byte(v >> 24)
+	b[1] = byte(v >> 16)
+	b[2] = byte(v >> 8)
+	b[3] = byte(v)
+}
+
+//nolint:errcheck
+func FuzzParseRTR(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ParseRTR(data)
+	})
+}
+
+// grep -r DecodeFromBytes pkg/packet/rtr/ | grep -e ":func " | perl -pe 's|func \(.* \*(.*?)\).*|(&\1\{\})\.DecodeFromBytes(data)|g' | awk -F ':' '{print $2}'
+//
+//nolint:errcheck
+func FuzzDecodeFromBytes(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		(&RTRCommon{}).DecodeFromBytes(data)
+		(&RTRReset{}).DecodeFromBytes(data)
+		(&RTRCacheResponse{}).DecodeFromBytes(data)
+		(&RTRIPPrefix{}).DecodeFromBytes(data)
+		(&RTRErrorReport{}).DecodeFromBytes(data)
 	})
 }

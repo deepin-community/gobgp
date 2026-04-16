@@ -18,24 +18,26 @@ package table
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/netip"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/k-sone/critbitgo"
-	api "github.com/osrg/gobgp/v3/api"
-	"github.com/osrg/gobgp/v3/pkg/config/oc"
-	"github.com/osrg/gobgp/v3/pkg/log"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
+	"github.com/gaissmai/bart"
+	"github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 )
 
 type PolicyOptions struct {
 	Info       *PeerInfo
-	OldNextHop net.IP
+	OldNextHop netip.Addr
 	Validate   func(*Path) *Validation
 }
 
@@ -98,6 +100,18 @@ const (
 	MATCH_OPTION_INVERT
 )
 
+func (o MatchOption) ToApi() api.MatchSet_Type {
+	switch o {
+	case MATCH_OPTION_ANY:
+		return api.MatchSet_TYPE_ANY
+	case MATCH_OPTION_ALL:
+		return api.MatchSet_TYPE_ALL
+	case MATCH_OPTION_INVERT:
+		return api.MatchSet_TYPE_INVERT
+	}
+	panic(fmt.Sprintf("unknown MatchOption: %d", o))
+}
+
 func (o MatchOption) String() string {
 	switch o {
 	case MATCH_OPTION_ANY:
@@ -124,7 +138,8 @@ func (o MatchOption) ConvertToMatchSetOptionsRestrictedType() oc.MatchSetOptions
 type MedActionType int
 
 const (
-	MED_ACTION_MOD MedActionType = iota
+	MED_ACTION_UNSPECIFIED MedActionType = iota
+	MED_ACTION_MOD
 	MED_ACTION_REPLACE
 )
 
@@ -156,6 +171,8 @@ const (
 	CONDITION_AFI_SAFI_IN
 	CONDITION_COMMUNITY_COUNT
 	CONDITION_ORIGIN
+	CONDITION_LOCAL_PREF_EQ
+	CONDITION_MED_EQ
 )
 
 type ActionType int
@@ -172,7 +189,7 @@ const (
 	ACTION_ORIGIN
 )
 
-func NewMatchOption(c interface{}) (MatchOption, error) {
+func NewMatchOption(c any) (MatchOption, error) {
 	switch t := c.(type) {
 	case oc.MatchSetOptionsType:
 		t = t.DefaultAsNeeded()
@@ -253,32 +270,29 @@ func (l DefinedSetList) Less(i, j int) bool {
 }
 
 type Prefix struct {
-	Prefix             *net.IPNet
-	AddressFamily      bgp.RouteFamily
+	Prefix             netip.Prefix
+	AddressFamily      bgp.Family
 	MasklengthRangeMax uint8
 	MasklengthRangeMin uint8
 }
 
 func (p *Prefix) Match(path *Path) bool {
-	rf := path.GetRouteFamily()
+	rf := path.GetFamily()
 	if rf != p.AddressFamily {
 		return false
 	}
 
-	var pAddr net.IP
+	var pAddr netip.Addr
 	var pMasklen uint8
 	switch rf {
-	case bgp.RF_IPv4_UC:
-		pAddr = path.GetNlri().(*bgp.IPAddrPrefix).Prefix
-		pMasklen = path.GetNlri().(*bgp.IPAddrPrefix).Length
-	case bgp.RF_IPv6_UC:
-		pAddr = path.GetNlri().(*bgp.IPv6AddrPrefix).Prefix
-		pMasklen = path.GetNlri().(*bgp.IPv6AddrPrefix).Length
+	case bgp.RF_IPv4_UC, bgp.RF_IPv6_UC:
+		pAddr = path.GetNlri().(*bgp.IPAddrPrefix).Prefix.Addr()
+		pMasklen = uint8(path.GetNlri().(*bgp.IPAddrPrefix).Prefix.Bits())
 	default:
 		return false
 	}
 
-	return (p.MasklengthRangeMin <= pMasklen && pMasklen <= p.MasklengthRangeMax) && p.Prefix.Contains(pAddr)
+	return p.MasklengthRangeMin <= pMasklen && pMasklen <= p.MasklengthRangeMax && p.Prefix.Contains(pAddr)
 }
 
 func (lhs *Prefix) Equal(rhs *Prefix) bool {
@@ -292,33 +306,16 @@ func (lhs *Prefix) Equal(rhs *Prefix) bool {
 }
 
 func (p *Prefix) PrefixString() string {
-	isZeros := func(p net.IP) bool {
-		for i := 0; i < len(p); i++ {
-			if p[i] != 0 {
-				return false
-			}
-		}
-		return true
-	}
-
-	ip := p.Prefix.IP
-	if p.AddressFamily == bgp.RF_IPv6_UC && isZeros(ip[0:10]) && ip[10] == 0xff && ip[11] == 0xff {
-		m, _ := p.Prefix.Mask.Size()
-		return fmt.Sprintf("::FFFF:%s/%d", ip.To16(), m)
-	}
 	return p.Prefix.String()
 }
 
 var _regexpPrefixRange = regexp.MustCompile(`(\d+)\.\.(\d+)`)
 
 func NewPrefix(c oc.Prefix) (*Prefix, error) {
-	_, prefix, err := net.ParseCIDR(c.IpPrefix)
-	if err != nil {
-		return nil, err
-	}
+	prefix := c.IpPrefix
 
 	rf := bgp.RF_IPv4_UC
-	if strings.Contains(c.IpPrefix, ":") {
+	if strings.Contains(c.IpPrefix.String(), ":") {
 		rf = bgp.RF_IPv6_UC
 	}
 	p := &Prefix{
@@ -328,7 +325,7 @@ func NewPrefix(c oc.Prefix) (*Prefix, error) {
 	maskRange := c.MasklengthRange
 
 	if maskRange == "" {
-		l, _ := prefix.Mask.Size()
+		l := prefix.Bits()
 		maskLength := uint8(l)
 		p.MasklengthRangeMax = maskLength
 		p.MasklengthRangeMin = maskLength
@@ -350,8 +347,8 @@ func NewPrefix(c oc.Prefix) (*Prefix, error) {
 
 type PrefixSet struct {
 	name   string
-	tree   *critbitgo.Net
-	family bgp.RouteFamily
+	tree   *bart.Table[[]*Prefix]
+	family bgp.Family
 }
 
 func (s *PrefixSet) Name() string {
@@ -374,17 +371,15 @@ func (lhs *PrefixSet) Append(arg DefinedSet) error {
 	} else if lhs.tree.Size() != 0 && rhs.family != lhs.family {
 		return fmt.Errorf("can't append different family")
 	}
-	rhs.tree.Walk(nil, func(r *net.IPNet, v interface{}) bool {
-		w, ok, _ := lhs.tree.Get(r)
-		if ok {
-			rp := v.([]*Prefix)
-			lp := w.([]*Prefix)
-			lhs.tree.Add(r, append(lp, rp...))
-		} else {
-			lhs.tree.Add(r, v)
-		}
-		return true
-	})
+
+	for r, v := range rhs.tree.All() {
+		lhs.tree.Modify(r, func(val []*Prefix, ok bool) ([]*Prefix, bool) {
+			if ok {
+				return append(val, v...), false
+			}
+			return v, false
+		})
+	}
 	lhs.family = rhs.family
 	return nil
 }
@@ -394,22 +389,14 @@ func (lhs *PrefixSet) Remove(arg DefinedSet) error {
 	if !ok {
 		return fmt.Errorf("type cast failed")
 	}
-	rhs.tree.Walk(nil, func(r *net.IPNet, v interface{}) bool {
-		w, ok, _ := lhs.tree.Get(r)
+	for r, rp := range rhs.tree.All() {
+		lp, ok := lhs.tree.Get(r)
 		if !ok {
-			return true
+			continue
 		}
-		rp := v.([]*Prefix)
-		lp := w.([]*Prefix)
 		new := make([]*Prefix, 0, len(lp))
 		for _, lp := range lp {
-			delete := false
-			for _, rp := range rp {
-				if lp.Equal(rp) {
-					delete = true
-					break
-				}
-			}
+			delete := slices.ContainsFunc(rp, lp.Equal)
 			if !delete {
 				new = append(new, lp)
 			}
@@ -417,10 +404,9 @@ func (lhs *PrefixSet) Remove(arg DefinedSet) error {
 		if len(new) == 0 {
 			lhs.tree.Delete(r)
 		} else {
-			lhs.tree.Add(r, new)
+			lhs.tree.Insert(r, new)
 		}
-		return true
-	})
+	}
 	return nil
 }
 
@@ -436,25 +422,21 @@ func (lhs *PrefixSet) Replace(arg DefinedSet) error {
 
 func (s *PrefixSet) List() []string {
 	var list []string
-	s.tree.Walk(nil, func(_ *net.IPNet, v interface{}) bool {
-		ps := v.([]*Prefix)
+	for _, ps := range s.tree.All() {
 		for _, p := range ps {
 			list = append(list, fmt.Sprintf("%s %d..%d", p.PrefixString(), p.MasklengthRangeMin, p.MasklengthRangeMax))
 		}
-		return true
-	})
+	}
 	return list
 }
 
 func (s *PrefixSet) ToConfig() *oc.PrefixSet {
 	list := make([]oc.Prefix, 0, s.tree.Size())
-	s.tree.Walk(nil, func(_ *net.IPNet, v interface{}) bool {
-		ps := v.([]*Prefix)
+	for _, ps := range s.tree.All() {
 		for _, p := range ps {
-			list = append(list, oc.Prefix{IpPrefix: p.PrefixString(), MasklengthRange: fmt.Sprintf("%d..%d", p.MasklengthRangeMin, p.MasklengthRangeMax)})
+			list = append(list, oc.Prefix{IpPrefix: netip.MustParsePrefix(p.PrefixString()), MasklengthRange: fmt.Sprintf("%d..%d", p.MasklengthRangeMin, p.MasklengthRangeMax)})
 		}
-		return true
-	})
+	}
 	return &oc.PrefixSet{
 		PrefixSetName: s.name,
 		PrefixList:    list,
@@ -473,21 +455,20 @@ func NewPrefixSetFromApiStruct(name string, prefixes []*Prefix) (*PrefixSet, err
 	if name == "" {
 		return nil, fmt.Errorf("empty prefix set name")
 	}
-	tree := critbitgo.NewNet()
-	var family bgp.RouteFamily
+	tree := new(bart.Table[[]*Prefix])
+	var family bgp.Family
 	for i, x := range prefixes {
 		if i == 0 {
 			family = x.AddressFamily
 		} else if family != x.AddressFamily {
 			return nil, fmt.Errorf("multiple families")
 		}
-		d, ok, _ := tree.Get(x.Prefix)
-		if ok {
-			ps := d.([]*Prefix)
-			tree.Add(x.Prefix, append(ps, x))
-		} else {
-			tree.Add(x.Prefix, []*Prefix{x})
-		}
+		tree.Modify(x.Prefix, func(val []*Prefix, ok bool) ([]*Prefix, bool) {
+			if ok {
+				return append(val, x), false
+			}
+			return []*Prefix{x}, false
+		})
 	}
 	return &PrefixSet{
 		name:   name,
@@ -504,8 +485,8 @@ func NewPrefixSet(c oc.PrefixSet) (*PrefixSet, error) {
 		}
 		return nil, fmt.Errorf("empty prefix set name")
 	}
-	tree := critbitgo.NewNet()
-	var family bgp.RouteFamily
+	tree := new(bart.Table[[]*Prefix])
+	var family bgp.Family
 	for i, x := range c.PrefixList {
 		y, err := NewPrefix(x)
 		if err != nil {
@@ -516,12 +497,11 @@ func NewPrefixSet(c oc.PrefixSet) (*PrefixSet, error) {
 		} else if family != y.AddressFamily {
 			return nil, fmt.Errorf("multiple families")
 		}
-		d, ok, _ := tree.Get(y.Prefix)
+		ps, ok := tree.Get(y.Prefix)
 		if ok {
-			ps := d.([]*Prefix)
-			tree.Add(y.Prefix, append(ps, y))
+			tree.Insert(y.Prefix, append(ps, y))
 		} else {
-			tree.Add(y.Prefix, []*Prefix{y})
+			tree.Insert(y.Prefix, []*Prefix{y})
 		}
 	}
 	return &PrefixSet{
@@ -532,7 +512,7 @@ func NewPrefixSet(c oc.PrefixSet) (*PrefixSet, error) {
 }
 
 type NextHopSet struct {
-	list []net.IPNet
+	list []netip.Prefix
 }
 
 func (s *NextHopSet) Name() string {
@@ -557,11 +537,11 @@ func (lhs *NextHopSet) Remove(arg DefinedSet) error {
 	if !ok {
 		return fmt.Errorf("type cast failed")
 	}
-	ps := make([]net.IPNet, 0, len(lhs.list))
+	ps := make([]netip.Prefix, 0, len(lhs.list))
 	for _, x := range lhs.list {
 		found := false
 		for _, y := range rhs.list {
-			if x.String() == y.String() {
+			if x == y {
 				found = true
 				break
 			}
@@ -603,31 +583,24 @@ func (s *NextHopSet) MarshalJSON() ([]byte, error) {
 	return json.Marshal(s.ToConfig())
 }
 
-func NewNextHopSetFromApiStruct(name string, list []net.IPNet) (*NextHopSet, error) {
+func NewNextHopSetFromApiStruct(name string, list []netip.Prefix) (*NextHopSet, error) {
 	return &NextHopSet{
 		list: list,
 	}, nil
 }
 
 func NewNextHopSet(c []string) (*NextHopSet, error) {
-	list := make([]net.IPNet, 0, len(c))
+	list := make([]netip.Prefix, 0, len(c))
 	for _, x := range c {
-		_, cidr, err := net.ParseCIDR(x)
+		p, err := netip.ParsePrefix(x)
 		if err != nil {
-			addr := net.ParseIP(x)
-			if addr == nil {
-				return nil, fmt.Errorf("invalid address or prefix: %s", x)
+			addr, err := netip.ParseAddr(x)
+			if err != nil {
+				return nil, fmt.Errorf("invalid address or prefix: %w", err)
 			}
-			mask := net.CIDRMask(32, 32)
-			if addr.To4() == nil {
-				mask = net.CIDRMask(128, 128)
-			}
-			cidr = &net.IPNet{
-				IP:   addr,
-				Mask: mask,
-			}
+			p = netip.PrefixFrom(addr, addr.BitLen())
 		}
-		list = append(list, *cidr)
+		list = append(list, p)
 	}
 	return &NextHopSet{
 		list: list,
@@ -788,10 +761,8 @@ func (m *singleAsPathMatch) Match(aspath []uint32) bool {
 	}
 	switch m.mode {
 	case INCLUDE:
-		for _, asn := range aspath {
-			if m.asn == asn {
-				return true
-			}
+		if slices.Contains(aspath, m.asn) {
+			return true
 		}
 	case LEFT_MOST:
 		if m.asn == aspath[0] {
@@ -890,13 +861,7 @@ func (lhs *AsPathSet) Remove(arg DefinedSet) error {
 	lhs.list = newList
 	newSingleList := make([]*singleAsPathMatch, 0, len(lhs.singleList))
 	for _, x := range lhs.singleList {
-		found := false
-		for _, y := range arg.(*AsPathSet).singleList {
-			if x.Equal(y) {
-				found = true
-				break
-			}
-		}
+		found := slices.ContainsFunc(arg.(*AsPathSet).singleList, x.Equal)
 		if !found {
 			newSingleList = append(newSingleList, x)
 		}
@@ -955,7 +920,7 @@ func NewAsPathSet(c oc.AsPathSet) (*AsPathSet, error) {
 		if s := NewSingleAsPathMatch(x); s != nil {
 			singleList = append(singleList, s)
 		} else {
-			exp, err := regexp.Compile(strings.Replace(x, "_", ASPATH_REGEXP_MAGIC, -1))
+			exp, err := regexp.Compile(strings.ReplaceAll(x, "_", ASPATH_REGEXP_MAGIC))
 			if err != nil {
 				return nil, fmt.Errorf("invalid regular expression: %s", x)
 			}
@@ -1150,7 +1115,7 @@ func ParseCommunityRegexp(arg string) (*regexp.Regexp, error) {
 	}
 
 	for i, v := range bgp.WellKnownCommunityNameMap {
-		if strings.Replace(strings.ToLower(arg), "_", "-", -1) == v {
+		if strings.ReplaceAll(strings.ToLower(arg), "_", "-") == v {
 			return regexp.Compile(fmt.Sprintf("^%d:%d$", i>>16, i&0x0000ffff))
 		}
 	}
@@ -1314,7 +1279,7 @@ func (s *LargeCommunitySet) MarshalJSON() ([]byte, error) {
 	return json.Marshal(s.ToConfig())
 }
 
-var _regexpCommunityLarge = regexp.MustCompile(`\d+:\d+:\d+`)
+var _regexpCommunityLarge = regexp.MustCompile(`^\d+:\d+:\d+$`)
 
 func ParseLargeCommunityRegexp(arg string) (*regexp.Regexp, error) {
 	if _regexpCommunityLarge.MatchString(arg) {
@@ -1392,12 +1357,12 @@ func (c *NextHopCondition) Evaluate(path *Path, options *PolicyOptions) bool {
 	// on the "original" nexthop. The current paths' nexthop has already been
 	// set and is ready to be advertised as per:
 	// https://tools.ietf.org/html/rfc4271#section-5.1.3
-	if options != nil && options.OldNextHop != nil &&
-		!options.OldNextHop.IsUnspecified() && !options.OldNextHop.Equal(nexthop) {
+	if options != nil && options.OldNextHop.IsValid() &&
+		!options.OldNextHop.IsUnspecified() && options.OldNextHop != nexthop {
 		nexthop = options.OldNextHop
 	}
 
-	if nexthop == nil {
+	if !nexthop.IsValid() {
 		return false
 	}
 
@@ -1446,26 +1411,30 @@ func (c *PrefixCondition) Option() MatchOption {
 // subsequent comparison is skipped if that matches the conditions.
 // If PrefixList's length is zero, return true.
 func (c *PrefixCondition) Evaluate(path *Path, _ *PolicyOptions) bool {
-	pathAfi, _ := bgp.RouteFamilyToAfiSafi(path.GetRouteFamily())
-	cAfi, _ := bgp.RouteFamilyToAfiSafi(c.set.family)
+	pathAfi := path.GetFamily().Afi()
+	cAfi := c.set.family.Afi()
 
 	if cAfi != pathAfi {
 		return false
 	}
 
-	r := nlriToIPNet(path.GetNlri())
-	if r == nil {
+	r := nlriToPrefix(path.GetNlri())
+	if !r.IsValid() {
 		return false
 	}
-	ones, _ := r.Mask.Size()
-	masklen := uint8(ones)
+	addr := r.Masked().Addr()
+	masklen := uint8(r.Bits())
 	result := false
-	if _, ps, _ := c.set.tree.Match(r); ps != nil {
-		for _, p := range ps.([]*Prefix) {
-			if p.MasklengthRangeMin <= masklen && masklen <= p.MasklengthRangeMax {
+	// Iterate all prefixes in the set and check supernet containment with mask-length range
+	for _, ps := range c.set.tree.Supernets(r) {
+		for _, p := range ps {
+			if p.MasklengthRangeMin <= masklen && masklen <= p.MasklengthRangeMax && p.Prefix.Contains(addr) {
 				result = true
 				break
 			}
+		}
+		if result {
+			break
 		}
 	}
 
@@ -1520,16 +1489,16 @@ func (c *NeighborCondition) Evaluate(path *Path, options *PolicyOptions) bool {
 	}
 
 	neighbor := path.GetSource().Address
-	if options != nil && options.Info != nil && options.Info.Address != nil {
+	if options != nil && options.Info != nil && options.Info.Address.IsValid() {
 		neighbor = options.Info.Address
 	}
 
-	if neighbor == nil {
+	if !neighbor.IsValid() {
 		return false
 	}
 	result := false
 	for _, n := range c.set.list {
-		if n.Contains(neighbor) {
+		if n.Contains(neighbor.AsSlice()) {
 			result = true
 			break
 		}
@@ -1715,14 +1684,13 @@ func (c *ExtCommunityCondition) Evaluate(path *Path, _ *PolicyOptions) bool {
 	result := false
 	for _, x := range es {
 		result = false
-		typ, subtype := x.GetTypes()
 		// match only with transitive community. see RFC7153
-		if typ >= 0x3f {
+		if !isTransitiveType(x) {
 			continue
 		}
 		var xStr string
 		for idx, y := range c.set.list {
-			if subtype == c.set.subtypeList[idx] {
+			if subTypeEqual(x, c.set.subtypeList[idx]) {
 				if len(xStr) == 0 {
 					// caching x.String() saves a lot of resources when matching against
 					// a lot of conditions, link hundreds of RTs.
@@ -1934,6 +1902,76 @@ func NewAsPathLengthCondition(c oc.AsPathLength) (*AsPathLengthCondition, error)
 	}, nil
 }
 
+type LocalPreqEqCondition struct {
+	localPref uint32
+}
+
+func (c *LocalPreqEqCondition) Type() ConditionType {
+	return CONDITION_LOCAL_PREF_EQ
+}
+
+func (c *LocalPreqEqCondition) Evaluate(path *Path, _ *PolicyOptions) bool {
+	result, err := path.GetLocalPref()
+	if err != nil {
+		return false
+	}
+	return c.localPref == result
+}
+
+func (c *LocalPreqEqCondition) Set() DefinedSet {
+	return nil
+}
+
+func (c *LocalPreqEqCondition) Name() string { return "" }
+
+func (c *LocalPreqEqCondition) String() string {
+	return fmt.Sprintf("=%d", c.localPref)
+}
+
+func NewLocalPrefEqCondition(value uint32) (*LocalPreqEqCondition, error) {
+	if value == 0 {
+		return nil, nil
+	}
+	return &LocalPreqEqCondition{
+		localPref: value,
+	}, nil
+}
+
+type MedEqCondition struct {
+	med uint32
+}
+
+func (c *MedEqCondition) Type() ConditionType {
+	return CONDITION_MED_EQ
+}
+
+func (c *MedEqCondition) Evaluate(path *Path, _ *PolicyOptions) bool {
+	result, err := path.GetMed()
+	if err != nil {
+		return false
+	}
+	return c.med == result
+}
+
+func (c *MedEqCondition) Set() DefinedSet {
+	return nil
+}
+
+func (c *MedEqCondition) Name() string { return "" }
+
+func (c *MedEqCondition) String() string {
+	return fmt.Sprintf("=%d", c.med)
+}
+
+func NewMedEqCondition(value uint32) (*MedEqCondition, error) {
+	if value == 0 {
+		return nil, nil
+	}
+	return &MedEqCondition{
+		med: value,
+	}, nil
+}
+
 type RpkiValidationCondition struct {
 	result oc.RpkiValidationResultType
 }
@@ -2043,7 +2081,7 @@ func NewOriginCondition(origin oc.BgpOriginAttrType) (*OriginCondition, error) {
 }
 
 type AfiSafiInCondition struct {
-	routeFamilies []bgp.RouteFamily
+	routeFamilies []bgp.Family
 }
 
 func (c *AfiSafiInCondition) Type() ConditionType {
@@ -2051,12 +2089,7 @@ func (c *AfiSafiInCondition) Type() ConditionType {
 }
 
 func (c *AfiSafiInCondition) Evaluate(path *Path, _ *PolicyOptions) bool {
-	for _, rf := range c.routeFamilies {
-		if path.GetRouteFamily() == rf {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.routeFamilies, path.GetFamily())
 }
 
 func (c *AfiSafiInCondition) Set() DefinedSet {
@@ -2078,12 +2111,12 @@ func NewAfiSafiInCondition(afiSafInConfig []oc.AfiSafiType) (*AfiSafiInCondition
 		return nil, nil
 	}
 
-	routeFamilies := make([]bgp.RouteFamily, 0, len(afiSafInConfig))
+	routeFamilies := make([]bgp.Family, 0, len(afiSafInConfig))
 	for _, afiSafiValue := range afiSafInConfig {
 		if err := afiSafiValue.Validate(); err != nil {
 			return nil, err
 		}
-		rf, err := bgp.GetRouteFamily(string(afiSafiValue))
+		rf, err := bgp.GetFamily(string(afiSafiValue))
 		if err != nil {
 			return nil, err
 		}
@@ -2170,13 +2203,12 @@ func RegexpRemoveExtCommunities(path *Path, exps []*regexp.Regexp, subtypes []bg
 	newComms := make([]bgp.ExtendedCommunityInterface, 0, len(comms))
 	for _, comm := range comms {
 		match := false
-		typ, subtype := comm.GetTypes()
 		// match only with transitive community. see RFC7153
-		if typ >= 0x3f {
+		if !isTransitiveType(comm) {
 			continue
 		}
 		for idx, exp := range exps {
-			if subtype == subtypes[idx] && exp.MatchString(comm.String()) {
+			if subTypeEqual(comm, subtypes[idx]) && exp.MatchString(comm.String()) {
 				match = true
 				break
 			}
@@ -2427,7 +2459,7 @@ func (a *LargeCommunityAction) ToConfig() *oc.SetLargeCommunity {
 	}
 	return &oc.SetLargeCommunity{
 		SetLargeCommunityMethod: oc.SetLargeCommunityMethod{CommunitiesList: cs},
-		Options:                 oc.BgpSetCommunityOptionType(a.action),
+		Options:                 a.action,
 	}
 }
 
@@ -2476,7 +2508,6 @@ func NewLargeCommunityAction(c oc.SetLargeCommunity) (*LargeCommunityAction, err
 		list:       list,
 		removeList: removeList,
 	}, nil
-
 }
 
 type MedAction struct {
@@ -2649,7 +2680,7 @@ func (a *AsPathPrependAction) Apply(path *Path, option *PolicyOptions) (*Path, e
 
 func (a *AsPathPrependAction) ToConfig() *oc.SetAsPathPrepend {
 	return &oc.SetAsPathPrepend{
-		RepeatN: uint8(a.repeat),
+		RepeatN: a.repeat,
 		As: func() string {
 			if a.useLeftMost {
 				return "last-as"
@@ -2693,7 +2724,7 @@ func NewAsPathPrependAction(action oc.SetAsPathPrepend) (*AsPathPrependAction, e
 }
 
 type NexthopAction struct {
-	value       net.IP
+	value       netip.Addr
 	self        bool
 	peerAddress bool
 	unchanged   bool
@@ -2706,17 +2737,17 @@ func (a *NexthopAction) Type() ActionType {
 func (a *NexthopAction) Apply(path *Path, options *PolicyOptions) (*Path, error) {
 	switch {
 	case a.self:
-		if options != nil && options.Info != nil && options.Info.LocalAddress != nil {
+		if options != nil && options.Info != nil && options.Info.LocalAddress.IsValid() {
 			path.SetNexthop(options.Info.LocalAddress)
 		}
 		return path, nil
 	case a.peerAddress:
-		if options != nil && options.Info != nil && options.Info.Address != nil {
+		if options != nil && options.Info != nil && options.Info.Address.IsValid() {
 			path.SetNexthop(options.Info.Address)
 		}
 		return path, nil
 	case a.unchanged:
-		if options != nil && options.OldNextHop != nil {
+		if options != nil && options.OldNextHop.IsValid() {
 			path.SetNexthop(options.OldNextHop)
 		}
 		return path, nil
@@ -2762,9 +2793,9 @@ func NewNexthopAction(c oc.BgpNextHopType) (*NexthopAction, error) {
 			unchanged: true,
 		}, nil
 	}
-	addr := net.ParseIP(string(c))
-	if addr == nil {
-		return nil, fmt.Errorf("invalid ip address format: %s", string(c))
+	addr, err := netip.ParseAddr(string(c))
+	if err != nil {
+		return nil, fmt.Errorf("invalid ip address format: %w", err)
 	}
 	return &NexthopAction{
 		value: addr,
@@ -2788,7 +2819,7 @@ func (s *Statement) Evaluate(p *Path, options *PolicyOptions) bool {
 	return true
 }
 
-func (s *Statement) Apply(logger log.Logger, path *Path, options *PolicyOptions) (RouteType, *Path) {
+func (s *Statement) Apply(logger *slog.Logger, path *Path, options *PolicyOptions) (RouteType, *Path) {
 	result := s.Evaluate(path, options)
 	if result {
 		if len(s.ModActions) != 0 {
@@ -2799,13 +2830,12 @@ func (s *Statement) Apply(logger log.Logger, path *Path, options *PolicyOptions)
 				path, err = action.Apply(path, options)
 				if err != nil {
 					logger.Warn("action failed",
-						log.Fields{
-							"Topic": "policy",
-							"Error": err})
+						slog.String("Topic", "policy"),
+						slog.String("Error", err.Error()))
 				}
 			}
 		}
-		//Routing action
+		// Routing action
 		if s.RouteAction == nil || reflect.ValueOf(s.RouteAction).IsNil() {
 			return ROUTE_TYPE_NONE, path
 		}
@@ -2842,7 +2872,13 @@ func (s *Statement) ToConfig() *oc.Statement {
 				case *LargeCommunityCondition:
 					cond.BgpConditions.MatchLargeCommunitySet = oc.MatchLargeCommunitySet{LargeCommunitySet: v.set.Name(), MatchSetOptions: oc.IntToMatchSetOptionsTypeMap[int(v.option)]}
 				case *NextHopCondition:
-					cond.BgpConditions.NextHopInList = v.set.List()
+					l := make([]netip.Addr, 0, len(v.set.list))
+					for _, n := range v.set.list {
+						if n.Addr().Is4() || n.Addr().Is6() {
+							l = append(l, n.Addr())
+						}
+					}
+					cond.BgpConditions.NextHopInList = l
 				case *RpkiValidationCondition:
 					cond.BgpConditions.RpkiValidationResult = v.result
 				case *RouteTypeCondition:
@@ -2855,6 +2891,10 @@ func (s *Statement) ToConfig() *oc.Statement {
 						res = append(res, oc.AfiSafiType(rf.String()))
 					}
 					cond.BgpConditions.AfiSafiInList = res
+				case *LocalPreqEqCondition:
+					cond.BgpConditions.LocalPrefEq = v.localPref
+				case *MedEqCondition:
+					cond.BgpConditions.MedEq = v.med
 				}
 			}
 			return cond
@@ -3062,10 +3102,20 @@ func NewStatement(c oc.Statement) (*Statement, error) {
 			return NewLargeCommunityCondition(c.Conditions.BgpConditions.MatchLargeCommunitySet)
 		},
 		func() (Condition, error) {
-			return NewNextHopCondition(c.Conditions.BgpConditions.NextHopInList)
+			l := make([]string, 0, len(c.Conditions.BgpConditions.NextHopInList))
+			for _, n := range c.Conditions.BgpConditions.NextHopInList {
+				l = append(l, n.String())
+			}
+			return NewNextHopCondition(l)
 		},
 		func() (Condition, error) {
 			return NewAfiSafiInCondition(c.Conditions.BgpConditions.AfiSafiInList)
+		},
+		func() (Condition, error) {
+			return NewLocalPrefEqCondition(c.Conditions.BgpConditions.LocalPrefEq)
+		},
+		func() (Condition, error) {
+			return NewMedEqCondition(c.Conditions.BgpConditions.MedEq)
 		},
 	}
 	cs = make([]Condition, 0, len(cfs))
@@ -3134,7 +3184,7 @@ type Policy struct {
 // Compare path with a policy's condition in stored order in the policy.
 // If a condition match, then this function stops evaluation and
 // subsequent conditions are skipped.
-func (p *Policy) Apply(logger log.Logger, path *Path, options *PolicyOptions) (RouteType, *Path) {
+func (p *Policy) Apply(logger *slog.Logger, path *Path, options *PolicyOptions) (RouteType, *Path) {
 	for _, stmt := range p.Statements {
 		var result RouteType
 		result, path = stmt.Apply(logger, path, options)
@@ -3253,7 +3303,7 @@ type RoutingPolicy struct {
 	statementMap  map[string]*Statement
 	assignmentMap map[string]*Assignment
 	mu            sync.RWMutex
-	logger        log.Logger
+	logger        *slog.Logger
 }
 
 func (r *RoutingPolicy) ApplyPolicy(id string, dir PolicyDirection, before *Path, options *PolicyOptions) *Path {
@@ -3315,10 +3365,9 @@ func (r *RoutingPolicy) getDefaultPolicy(id string, dir PolicyDirection) RouteTy
 	default:
 		return ROUTE_TYPE_NONE
 	}
-
 }
 
-func (r *RoutingPolicy) setPolicy(id string, dir PolicyDirection, policies []*Policy) error {
+func (r *RoutingPolicy) setPolicy(id string, dir PolicyDirection, policies []*Policy) {
 	a, ok := r.assignmentMap[id]
 	if !ok {
 		a = &Assignment{}
@@ -3330,10 +3379,9 @@ func (r *RoutingPolicy) setPolicy(id string, dir PolicyDirection, policies []*Po
 		a.exportPolicies = policies
 	}
 	r.assignmentMap[id] = a
-	return nil
 }
 
-func (r *RoutingPolicy) setDefaultPolicy(id string, dir PolicyDirection, typ RouteType) error {
+func (r *RoutingPolicy) setDefaultPolicy(id string, dir PolicyDirection, typ RouteType) {
 	a, ok := r.assignmentMap[id]
 	if !ok {
 		a = &Assignment{}
@@ -3345,7 +3393,6 @@ func (r *RoutingPolicy) setDefaultPolicy(id string, dir PolicyDirection, typ Rou
 		a.defaultExportPolicy = typ
 	}
 	r.assignmentMap[id] = a
-	return nil
 }
 
 func (r *RoutingPolicy) getAssignmentFromConfig(dir PolicyDirection, a oc.ApplyPolicy) ([]*Policy, RouteType, error) {
@@ -3436,6 +3483,8 @@ func (r *RoutingPolicy) validateCondition(v Condition) (err error) {
 	case CONDITION_AFI_SAFI_IN:
 	case CONDITION_AS_PATH_LENGTH:
 	case CONDITION_RPKI:
+	case CONDITION_LOCAL_PREF_EQ:
+	case CONDITION_MED_EQ:
 	}
 	return nil
 }
@@ -3704,7 +3753,7 @@ func (r *RoutingPolicy) AddStatement(st *Statement) (err error) {
 
 	for _, c := range st.Conditions {
 		if err = r.validateCondition(c); err != nil {
-			return
+			return err
 		}
 	}
 	m := r.statementMap
@@ -3771,7 +3820,7 @@ func (r *RoutingPolicy) AddPolicy(x *Policy, refer bool) (err error) {
 	for _, st := range x.Statements {
 		for _, c := range st.Conditions {
 			if err = r.validateCondition(c); err != nil {
-				return
+				return err
 			}
 		}
 	}
@@ -3786,7 +3835,7 @@ func (r *RoutingPolicy) AddPolicy(x *Policy, refer bool) (err error) {
 		for _, st := range x.Statements {
 			if _, ok := sMap[st.Name]; ok {
 				err = fmt.Errorf("statement %s already defined", st.Name)
-				return
+				return err
 			}
 			sMap[st.Name] = st
 		}
@@ -3810,7 +3859,7 @@ func (r *RoutingPolicy) DeletePolicy(x *Policy, all, preserve bool, activeId []s
 	y, ok := pMap[name]
 	if !ok {
 		err = fmt.Errorf("not found policy: %s", name)
-		return
+		return err
 	}
 	inUse := func(ids []string) bool {
 		for _, id := range ids {
@@ -3828,12 +3877,11 @@ func (r *RoutingPolicy) DeletePolicy(x *Policy, all, preserve bool, activeId []s
 	if all {
 		if inUse(activeId) {
 			err = fmt.Errorf("can't delete. policy %s is in use", name)
-			return
+			return err
 		}
 		r.logger.Debug("delete policy",
-			log.Fields{
-				"Topic": "Policy",
-				"Key":   name})
+			slog.String("Topic", "Policy"),
+			slog.String("Key", name))
 		delete(pMap, name)
 	} else {
 		err = y.Remove(x)
@@ -3842,9 +3890,8 @@ func (r *RoutingPolicy) DeletePolicy(x *Policy, all, preserve bool, activeId []s
 		for _, st := range y.Statements {
 			if !r.statementInUse(st) {
 				r.logger.Debug("delete unused statement",
-					log.Fields{
-						"Topic": "Policy",
-						"Key":   st.Name})
+					slog.String("Topic", "Policy"),
+					slog.String("Key", st.Name))
 				delete(sMap, st.Name)
 			}
 		}
@@ -3872,32 +3919,32 @@ func (r *RoutingPolicy) AddPolicyAssignment(id string, dir PolicyDirection, poli
 		p, ok := r.policyMap[x.Name]
 		if !ok {
 			err = fmt.Errorf("not found policy %s", x.Name)
-			return
+			return err
 		}
 		if seen[x.Name] {
 			err = fmt.Errorf("duplicated policy %s", x.Name)
-			return
+			return err
 		}
 		seen[x.Name] = true
 		ps = append(ps, p)
 	}
 	cur := r.getPolicy(id, dir)
 	if cur == nil {
-		err = r.setPolicy(id, dir, ps)
+		r.setPolicy(id, dir, ps)
 	} else {
 		seen = make(map[string]bool)
 		ps = append(cur, ps...)
 		for _, x := range ps {
 			if seen[x.Name] {
 				err = fmt.Errorf("duplicated policy %s", x.Name)
-				return
+				return err
 			}
 			seen[x.Name] = true
 		}
-		err = r.setPolicy(id, dir, ps)
+		r.setPolicy(id, dir, ps)
 	}
 	if err == nil && def != ROUTE_TYPE_NONE {
-		err = r.setDefaultPolicy(id, dir, def)
+		r.setDefaultPolicy(id, dir, def)
 	}
 	return err
 }
@@ -3912,11 +3959,11 @@ func (r *RoutingPolicy) DeletePolicyAssignment(id string, dir PolicyDirection, p
 		p, ok := r.policyMap[x.Name]
 		if !ok {
 			err = fmt.Errorf("not found policy %s", x.Name)
-			return
+			return err
 		}
 		if seen[x.Name] {
 			err = fmt.Errorf("duplicated policy %s", x.Name)
-			return
+			return err
 		}
 		seen[x.Name] = true
 		ps = append(ps, p)
@@ -3924,11 +3971,8 @@ func (r *RoutingPolicy) DeletePolicyAssignment(id string, dir PolicyDirection, p
 	cur := r.getPolicy(id, dir)
 
 	if all {
-		err = r.setPolicy(id, dir, nil)
-		if err != nil {
-			return
-		}
-		err = r.setDefaultPolicy(id, dir, ROUTE_TYPE_NONE)
+		r.setPolicy(id, dir, nil)
+		r.setDefaultPolicy(id, dir, ROUTE_TYPE_NONE)
 	} else {
 		l := len(cur) - len(ps)
 		if l < 0 {
@@ -3948,7 +3992,7 @@ func (r *RoutingPolicy) DeletePolicyAssignment(id string, dir PolicyDirection, p
 				n = append(n, y)
 			}
 		}
-		err = r.setPolicy(id, dir, n)
+		r.setPolicy(id, dir, n)
 	}
 	return err
 }
@@ -3963,19 +4007,19 @@ func (r *RoutingPolicy) SetPolicyAssignment(id string, dir PolicyDirection, poli
 		p, ok := r.policyMap[x.Name]
 		if !ok {
 			err = fmt.Errorf("not found policy %s", x.Name)
-			return
+			return err
 		}
 		if seen[x.Name] {
 			err = fmt.Errorf("duplicated policy %s", x.Name)
-			return
+			return err
 		}
 		seen[x.Name] = true
 		ps = append(ps, p)
 	}
 	r.getPolicy(id, dir)
-	err = r.setPolicy(id, dir, ps)
-	if err == nil && def != ROUTE_TYPE_NONE {
-		err = r.setDefaultPolicy(id, dir, def)
+	r.setPolicy(id, dir, ps)
+	if def != ROUTE_TYPE_NONE {
+		r.setDefaultPolicy(id, dir, def)
 	}
 	return err
 }
@@ -3986,9 +4030,8 @@ func (r *RoutingPolicy) Initialize() error {
 
 	if err := r.reload(oc.RoutingPolicy{}); err != nil {
 		r.logger.Error("failed to create routing policy",
-			log.Fields{
-				"Topic": "Policy",
-				"Error": err})
+			slog.String("Topic", "Policy"),
+			slog.String("Error", err.Error()))
 		return err
 	}
 	return nil
@@ -3999,10 +4042,9 @@ func (r *RoutingPolicy) setPeerPolicy(id string, c oc.ApplyPolicy) {
 		ps, def, err := r.getAssignmentFromConfig(dir, c)
 		if err != nil {
 			r.logger.Error("failed to get policy info",
-				log.Fields{
-					"Topic": "Policy",
-					"Dir":   dir,
-					"Error": err})
+				slog.String("Topic", "Policy"),
+				slog.String("Dir", dir.String()),
+				slog.String("Error", err.Error()))
 			continue
 		}
 		r.setDefaultPolicy(id, dir, def)
@@ -4028,9 +4070,8 @@ func (r *RoutingPolicy) Reset(rp *oc.RoutingPolicy, ap map[string]oc.ApplyPolicy
 
 	if err := r.reload(*rp); err != nil {
 		r.logger.Error("failed to create routing policy",
-			log.Fields{
-				"Topic": "Policy",
-				"Error": err})
+			slog.String("Topic", "Policy"),
+			slog.String("Error", err.Error()))
 		return err
 	}
 
@@ -4040,7 +4081,7 @@ func (r *RoutingPolicy) Reset(rp *oc.RoutingPolicy, ap map[string]oc.ApplyPolicy
 	return nil
 }
 
-func NewRoutingPolicy(logger log.Logger) *RoutingPolicy {
+func NewRoutingPolicy(logger *slog.Logger) *RoutingPolicy {
 	return &RoutingPolicy{
 		definedSetMap: make(map[DefinedType]map[string]DefinedSet),
 		policyMap:     make(map[string]*Policy),
@@ -4051,24 +4092,35 @@ func NewRoutingPolicy(logger log.Logger) *RoutingPolicy {
 }
 
 func CanImportToVrf(v *Vrf, path *Path) bool {
-	f := func(arg []bgp.ExtendedCommunityInterface) []string {
-		ret := make([]string, 0, len(arg))
-		for _, a := range arg {
-			ret = append(ret, fmt.Sprintf("RT:%s", a.String()))
+	extComms := path.GetExtCommunities()
+	for _, x := range extComms {
+		// match only with transitive community. see RFC7153
+		if !isTransitiveType(x) {
+			continue
 		}
-		return ret
+		key, err := extCommRouteTargetKey(x)
+		if err != nil {
+			continue
+		}
+		if _, found := v.ImportRt[key]; found {
+			return true
+		}
 	}
-	set, _ := NewExtCommunitySet(oc.ExtCommunitySet{
-		ExtCommunitySetName: v.Name,
-		ExtCommunityList:    f(v.ImportRt),
-	})
-	matchSet := oc.MatchExtCommunitySet{
-		ExtCommunitySet: v.Name,
-		MatchSetOptions: oc.MATCH_SET_OPTIONS_TYPE_ANY,
+	return false
+}
+
+func isTransitiveType(ec bgp.ExtendedCommunityInterface) bool {
+	if ecType, _ := ec.GetTypes(); ecType < bgp.EC_TYPE_NON_TRANSITIVE_TWO_OCTET_AS_SPECIFIC {
+		return true
 	}
-	c, _ := NewExtCommunityCondition(matchSet)
-	c.set = set
-	return c.Evaluate(path, nil)
+	return false
+}
+
+func subTypeEqual(ec bgp.ExtendedCommunityInterface, st bgp.ExtendedCommunityAttrSubType) bool {
+	if _, ecSubType := ec.GetTypes(); ecSubType == st {
+		return true
+	}
+	return false
 }
 
 type PolicyAssignment struct {
@@ -4078,6 +4130,19 @@ type PolicyAssignment struct {
 	Default  RouteType
 }
 
+func ToComparisonApi(c oc.AttributeComparison) api.Comparison {
+	switch c {
+	case oc.ATTRIBUTE_COMPARISON_ATTRIBUTE_EQ, oc.ATTRIBUTE_COMPARISON_EQ:
+		return api.Comparison_COMPARISON_EQ
+	case oc.ATTRIBUTE_COMPARISON_ATTRIBUTE_GE, oc.ATTRIBUTE_COMPARISON_GE:
+		return api.Comparison_COMPARISON_GE
+	case oc.ATTRIBUTE_COMPARISON_ATTRIBUTE_LE, oc.ATTRIBUTE_COMPARISON_LE:
+		return api.Comparison_COMPARISON_LE
+	default:
+		return api.Comparison_COMPARISON_EQ
+	}
+}
+
 var _regexpMedActionType = regexp.MustCompile(`([+-]?)(\d+)`)
 
 func toStatementApi(s *oc.Statement) *api.Statement {
@@ -4085,60 +4150,65 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 	o, _ := NewMatchOption(s.Conditions.MatchPrefixSet.MatchSetOptions)
 	if s.Conditions.MatchPrefixSet.PrefixSet != "" {
 		cs.PrefixSet = &api.MatchSet{
-			Type: api.MatchSet_Type(o),
+			Type: o.ToApi(),
 			Name: s.Conditions.MatchPrefixSet.PrefixSet,
 		}
 	}
 	if s.Conditions.MatchNeighborSet.NeighborSet != "" {
 		o, _ := NewMatchOption(s.Conditions.MatchNeighborSet.MatchSetOptions)
 		cs.NeighborSet = &api.MatchSet{
-			Type: api.MatchSet_Type(o),
+			Type: o.ToApi(),
 			Name: s.Conditions.MatchNeighborSet.NeighborSet,
 		}
 	}
+
 	if s.Conditions.BgpConditions.CommunityCount.Operator != "" {
 		cs.CommunityCount = &api.CommunityCount{
 			Count: s.Conditions.BgpConditions.CommunityCount.Value,
-			Type:  api.CommunityCount_Type(s.Conditions.BgpConditions.CommunityCount.Operator.ToInt()),
+			Type:  ToComparisonApi(s.Conditions.BgpConditions.CommunityCount.Operator),
 		}
 	}
 	if s.Conditions.BgpConditions.OriginEq.ToInt() != -1 {
 		switch s.Actions.BgpActions.SetRouteOrigin {
 		case oc.BGP_ORIGIN_ATTR_TYPE_IGP:
-			cs.Origin = api.RouteOriginType_ORIGIN_IGP
+			cs.Origin = api.OriginType_ORIGIN_TYPE_IGP
 		case oc.BGP_ORIGIN_ATTR_TYPE_EGP:
-			cs.Origin = api.RouteOriginType_ORIGIN_EGP
+			cs.Origin = api.OriginType_ORIGIN_TYPE_EGP
 		case oc.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE:
-			cs.Origin = api.RouteOriginType_ORIGIN_INCOMPLETE
+			cs.Origin = api.OriginType_ORIGIN_TYPE_INCOMPLETE
 		}
 	}
 	if s.Conditions.BgpConditions.AsPathLength.Operator != "" {
 		cs.AsPathLength = &api.AsPathLength{
 			Length: s.Conditions.BgpConditions.AsPathLength.Value,
-			Type:   api.AsPathLength_Type(s.Conditions.BgpConditions.AsPathLength.Operator.ToInt()),
+			Type:   ToComparisonApi(s.Conditions.BgpConditions.AsPathLength.Operator),
 		}
 	}
 	if s.Conditions.BgpConditions.MatchAsPathSet.AsPathSet != "" {
+		o, _ := NewMatchOption(s.Conditions.BgpConditions.MatchAsPathSet.MatchSetOptions)
 		cs.AsPathSet = &api.MatchSet{
-			Type: api.MatchSet_Type(s.Conditions.BgpConditions.MatchAsPathSet.MatchSetOptions.ToInt()),
+			Type: o.ToApi(),
 			Name: s.Conditions.BgpConditions.MatchAsPathSet.AsPathSet,
 		}
 	}
 	if s.Conditions.BgpConditions.MatchCommunitySet.CommunitySet != "" {
+		o, _ := NewMatchOption(s.Conditions.BgpConditions.MatchCommunitySet.MatchSetOptions)
 		cs.CommunitySet = &api.MatchSet{
-			Type: api.MatchSet_Type(s.Conditions.BgpConditions.MatchCommunitySet.MatchSetOptions.ToInt()),
+			Type: o.ToApi(),
 			Name: s.Conditions.BgpConditions.MatchCommunitySet.CommunitySet,
 		}
 	}
 	if s.Conditions.BgpConditions.MatchExtCommunitySet.ExtCommunitySet != "" {
+		o, _ := NewMatchOption(s.Conditions.BgpConditions.MatchExtCommunitySet.MatchSetOptions)
 		cs.ExtCommunitySet = &api.MatchSet{
-			Type: api.MatchSet_Type(s.Conditions.BgpConditions.MatchExtCommunitySet.MatchSetOptions.ToInt()),
+			Type: o.ToApi(),
 			Name: s.Conditions.BgpConditions.MatchExtCommunitySet.ExtCommunitySet,
 		}
 	}
 	if s.Conditions.BgpConditions.MatchLargeCommunitySet.LargeCommunitySet != "" {
+		o, _ := NewMatchOption(s.Conditions.BgpConditions.MatchLargeCommunitySet.MatchSetOptions)
 		cs.LargeCommunitySet = &api.MatchSet{
-			Type: api.MatchSet_Type(s.Conditions.BgpConditions.MatchLargeCommunitySet.MatchSetOptions.ToInt()),
+			Type: o.ToApi(),
 			Name: s.Conditions.BgpConditions.MatchLargeCommunitySet.LargeCommunitySet,
 		}
 	}
@@ -4146,36 +4216,70 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 		cs.RouteType = api.Conditions_RouteType(s.Conditions.BgpConditions.RouteType.ToInt())
 	}
 	if len(s.Conditions.BgpConditions.NextHopInList) > 0 {
-		cs.NextHopInList = s.Conditions.BgpConditions.NextHopInList
+		l := make([]string, 0, len(s.Conditions.BgpConditions.NextHopInList))
+		for _, n := range s.Conditions.BgpConditions.NextHopInList {
+			l = append(l, n.String())
+		}
+		cs.NextHopInList = l
 	}
 	if s.Conditions.BgpConditions.AfiSafiInList != nil {
 		afiSafiIn := make([]*api.Family, 0)
 		for _, afiSafiType := range s.Conditions.BgpConditions.AfiSafiInList {
 			if mapped, ok := bgp.AddressFamilyValueMap[string(afiSafiType)]; ok {
-				afi, safi := bgp.RouteFamilyToAfiSafi(mapped)
-				afiSafiIn = append(afiSafiIn, &api.Family{Afi: api.Family_Afi(afi), Safi: api.Family_Safi(safi)})
+				afiSafiIn = append(afiSafiIn, &api.Family{Afi: api.Family_Afi(mapped.Afi()), Safi: api.Family_Safi(mapped.Safi())})
 			}
 		}
 		cs.AfiSafiIn = afiSafiIn
 	}
-	cs.RpkiResult = int32(s.Conditions.BgpConditions.RpkiValidationResult.ToInt())
+	if s.Conditions.BgpConditions.LocalPrefEq != 0 {
+		cs.LocalPrefEq = &api.LocalPrefEq{Value: s.Conditions.BgpConditions.LocalPrefEq}
+	}
+	if s.Conditions.BgpConditions.MedEq != 0 {
+		cs.MedEq = &api.MedEq{Value: s.Conditions.BgpConditions.MedEq}
+	}
+	switch s.Conditions.BgpConditions.RpkiValidationResult {
+	case oc.RPKI_VALIDATION_RESULT_TYPE_NONE:
+		cs.RpkiResult = api.ValidationState_VALIDATION_STATE_NONE
+	case oc.RPKI_VALIDATION_RESULT_TYPE_NOT_FOUND:
+		cs.RpkiResult = api.ValidationState_VALIDATION_STATE_NOT_FOUND
+	case oc.RPKI_VALIDATION_RESULT_TYPE_VALID:
+		cs.RpkiResult = api.ValidationState_VALIDATION_STATE_VALID
+	case oc.RPKI_VALIDATION_RESULT_TYPE_INVALID:
+		cs.RpkiResult = api.ValidationState_VALIDATION_STATE_INVALID
+	}
+	community_action := func(action string) api.CommunityAction_Type {
+		fmt.Println("action0", action)
+		switch oc.BgpSetCommunityOptionType(action) {
+		case oc.BGP_SET_COMMUNITY_OPTION_TYPE_ADD:
+			fmt.Println("action1", action)
+			return api.CommunityAction_TYPE_ADD
+		case oc.BGP_SET_COMMUNITY_OPTION_TYPE_REMOVE:
+			fmt.Println("action2", action)
+			return api.CommunityAction_TYPE_REMOVE
+		case oc.BGP_SET_COMMUNITY_OPTION_TYPE_REPLACE:
+			fmt.Println("action3", action)
+			return api.CommunityAction_TYPE_REPLACE
+		}
+		return api.CommunityAction_TYPE_UNSPECIFIED
+	}
 	as := &api.Actions{
 		RouteAction: func() api.RouteAction {
 			switch s.Actions.RouteDisposition {
 			case oc.ROUTE_DISPOSITION_ACCEPT_ROUTE:
-				return api.RouteAction_ACCEPT
+				return api.RouteAction_ROUTE_ACTION_ACCEPT
 			case oc.ROUTE_DISPOSITION_REJECT_ROUTE:
-				return api.RouteAction_REJECT
+				return api.RouteAction_ROUTE_ACTION_REJECT
 			}
-			return api.RouteAction_NONE
+			return api.RouteAction_ROUTE_ACTION_UNSPECIFIED
 		}(),
 		Community: func() *api.CommunityAction {
 			if len(s.Actions.BgpActions.SetCommunity.SetCommunityMethod.CommunitiesList) == 0 {
 				return nil
 			}
 			return &api.CommunityAction{
-				Type:        api.CommunityAction_Type(oc.BgpSetCommunityOptionTypeToIntMap[oc.BgpSetCommunityOptionType(s.Actions.BgpActions.SetCommunity.Options)]),
-				Communities: s.Actions.BgpActions.SetCommunity.SetCommunityMethod.CommunitiesList}
+				Type:        community_action(s.Actions.BgpActions.SetCommunity.Options),
+				Communities: s.Actions.BgpActions.SetCommunity.SetCommunityMethod.CommunitiesList,
+			}
 		}(),
 		Med: func() *api.MedAction {
 			medStr := strings.TrimSpace(string(s.Actions.BgpActions.SetMed))
@@ -4186,10 +4290,10 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 			if len(matches) == 0 {
 				return nil
 			}
-			action := api.MedAction_REPLACE
+			action := api.MedAction_TYPE_REPLACE
 			switch matches[1] {
 			case "+", "-":
-				action = api.MedAction_MOD
+				action = api.MedAction_TYPE_MOD
 			}
 			value, err := strconv.ParseInt(matches[1]+matches[2], 10, 64)
 			if err != nil {
@@ -4222,7 +4326,7 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 				return nil
 			}
 			return &api.CommunityAction{
-				Type:        api.CommunityAction_Type(oc.BgpSetCommunityOptionTypeToIntMap[oc.BgpSetCommunityOptionType(s.Actions.BgpActions.SetExtCommunity.Options)]),
+				Type:        community_action(s.Actions.BgpActions.SetExtCommunity.Options),
 				Communities: s.Actions.BgpActions.SetExtCommunity.SetExtCommunityMethod.CommunitiesList,
 			}
 		}(),
@@ -4231,7 +4335,7 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 				return nil
 			}
 			return &api.CommunityAction{
-				Type:        api.CommunityAction_Type(oc.BgpSetCommunityOptionTypeToIntMap[oc.BgpSetCommunityOptionType(s.Actions.BgpActions.SetLargeCommunity.Options)]),
+				Type:        community_action(string(s.Actions.BgpActions.SetLargeCommunity.Options)),
 				Communities: s.Actions.BgpActions.SetLargeCommunity.SetLargeCommunityMethod.CommunitiesList,
 			}
 		}(),
@@ -4268,14 +4372,14 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 			if s.Actions.BgpActions.SetRouteOrigin.ToInt() == -1 {
 				return nil
 			}
-			var apiOrigin api.RouteOriginType
+			var apiOrigin api.OriginType
 			switch s.Actions.BgpActions.SetRouteOrigin {
 			case oc.BGP_ORIGIN_ATTR_TYPE_IGP:
-				apiOrigin = api.RouteOriginType_ORIGIN_IGP
+				apiOrigin = api.OriginType_ORIGIN_TYPE_IGP
 			case oc.BGP_ORIGIN_ATTR_TYPE_EGP:
-				apiOrigin = api.RouteOriginType_ORIGIN_EGP
+				apiOrigin = api.OriginType_ORIGIN_TYPE_EGP
 			case oc.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE:
-				apiOrigin = api.RouteOriginType_ORIGIN_INCOMPLETE
+				apiOrigin = api.OriginType_ORIGIN_TYPE_INCOMPLETE
 			default:
 				return nil
 			}
@@ -4311,20 +4415,20 @@ func NewAPIPolicyAssignmentFromTableStruct(t *PolicyAssignment) *api.PolicyAssig
 		Direction: func() api.PolicyDirection {
 			switch t.Type {
 			case POLICY_DIRECTION_IMPORT:
-				return api.PolicyDirection_IMPORT
+				return api.PolicyDirection_POLICY_DIRECTION_IMPORT
 			case POLICY_DIRECTION_EXPORT:
-				return api.PolicyDirection_EXPORT
+				return api.PolicyDirection_POLICY_DIRECTION_EXPORT
 			}
-			return api.PolicyDirection_UNKNOWN
+			return api.PolicyDirection_POLICY_DIRECTION_UNSPECIFIED
 		}(),
 		DefaultAction: func() api.RouteAction {
 			switch t.Default {
 			case ROUTE_TYPE_ACCEPT:
-				return api.RouteAction_ACCEPT
+				return api.RouteAction_ROUTE_ACTION_ACCEPT
 			case ROUTE_TYPE_REJECT:
-				return api.RouteAction_REJECT
+				return api.RouteAction_ROUTE_ACTION_REJECT
 			}
-			return api.RouteAction_NONE
+			return api.RouteAction_ROUTE_ACTION_UNSPECIFIED
 		}(),
 		Name: t.Name,
 		Policies: func() []*api.Policy {
