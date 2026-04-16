@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/osrg/gobgp/v3/pkg/server"
+	"github.com/osrg/gobgp/v4/pkg/server"
 )
 
 // ExampleUpdateConfig shows how InitialConfig can be used without UpdateConfig
@@ -22,7 +22,6 @@ func ExampleInitialConfig() {
 
 	isGracefulRestart := true
 	_, err = InitialConfig(context.Background(), bgpServer, initialConfig, isGracefulRestart)
-
 	if err != nil {
 		// Handle error
 		return
@@ -43,7 +42,6 @@ func ExampleUpdateConfig() {
 
 	isGracefulRestart := true
 	currentConfig, err := InitialConfig(context.Background(), bgpServer, initialConfig, isGracefulRestart)
-
 	if err != nil {
 		// Handle error
 		return

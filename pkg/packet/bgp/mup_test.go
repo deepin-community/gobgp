@@ -35,11 +35,9 @@ func Test_MUPInterworkSegmentDiscoveryRouteIPv4(t *testing.T) {
 	}
 	n1 := NewMUPNLRI(AFI_IP, MUP_ARCH_TYPE_3GPP_5G, MUP_ROUTE_TYPE_INTERWORK_SEGMENT_DISCOVERY, r)
 	buf1, err := n1.Serialize()
-	assert.Nil(err)
-	n2, err := NewPrefixFromRouteFamily(RouteFamilyToAfiSafi(RF_MUP_IPv4))
-	assert.Nil(err)
-	err = n2.DecodeFromBytes(buf1)
-	assert.Nil(err)
+	assert.NoError(err)
+	n2, err := NLRIFromSlice(RF_MUP_IPv4, buf1)
+	assert.NoError(err)
 
 	t.Logf("%s", n1)
 	t.Logf("%s", n2)
@@ -56,11 +54,9 @@ func Test_MUPInterworkSegmentDiscoveryRouteIPv6(t *testing.T) {
 	}
 	n1 := NewMUPNLRI(AFI_IP6, MUP_ARCH_TYPE_3GPP_5G, MUP_ROUTE_TYPE_INTERWORK_SEGMENT_DISCOVERY, r)
 	buf1, err := n1.Serialize()
-	assert.Nil(err)
-	n2, err := NewPrefixFromRouteFamily(RouteFamilyToAfiSafi(RF_MUP_IPv6))
-	assert.Nil(err)
-	err = n2.DecodeFromBytes(buf1)
-	assert.Nil(err)
+	assert.NoError(err)
+	n2, err := NLRIFromSlice(RF_MUP_IPv6, buf1)
+	assert.NoError(err)
 
 	t.Logf("%s", n1)
 	t.Logf("%s", n2)
@@ -77,11 +73,9 @@ func Test_MUPDirectSegmentDiscoveryRouteIPv4(t *testing.T) {
 	}
 	n1 := NewMUPNLRI(AFI_IP, MUP_ARCH_TYPE_3GPP_5G, MUP_ROUTE_TYPE_DIRECT_SEGMENT_DISCOVERY, r)
 	buf1, err := n1.Serialize()
-	assert.Nil(err)
-	n2, err := NewPrefixFromRouteFamily(RouteFamilyToAfiSafi(RF_MUP_IPv4))
-	assert.Nil(err)
-	err = n2.DecodeFromBytes(buf1)
-	assert.Nil(err)
+	assert.NoError(err)
+	n2, err := NLRIFromSlice(RF_MUP_IPv4, buf1)
+	assert.NoError(err)
 
 	t.Logf("%s", n1)
 	t.Logf("%s", n2)
@@ -98,11 +92,9 @@ func Test_MUPDirectSegmentDiscoveryRouteIPv6(t *testing.T) {
 	}
 	n1 := NewMUPNLRI(AFI_IP6, MUP_ARCH_TYPE_3GPP_5G, MUP_ROUTE_TYPE_DIRECT_SEGMENT_DISCOVERY, r)
 	buf1, err := n1.Serialize()
-	assert.Nil(err)
-	n2, err := NewPrefixFromRouteFamily(RouteFamilyToAfiSafi(RF_MUP_IPv6))
-	assert.Nil(err)
-	err = n2.DecodeFromBytes(buf1)
-	assert.Nil(err)
+	assert.NoError(err)
+	n2, err := NLRIFromSlice(RF_MUP_IPv6, buf1)
+	assert.NoError(err)
 
 	t.Logf("%s", n1)
 	t.Logf("%s", n2)
@@ -119,7 +111,7 @@ func Test_MUPType1SessionTransformedRoute(t *testing.T) {
 		name string
 		in   *MUPType1SessionTransformedRoute
 		afi  uint16
-		rf   RouteFamily
+		rf   Family
 	}{
 		{
 			name: "IPv4",
@@ -183,11 +175,9 @@ func Test_MUPType1SessionTransformedRoute(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			n1 := NewMUPNLRI(tt.afi, MUP_ARCH_TYPE_3GPP_5G, MUP_ROUTE_TYPE_TYPE_1_SESSION_TRANSFORMED, tt.in)
 			buf1, err := n1.Serialize()
-			assert.Nil(err)
-			n2, err := NewPrefixFromRouteFamily(RouteFamilyToAfiSafi(tt.rf))
-			assert.Nil(err)
-			err = n2.DecodeFromBytes(buf1)
-			assert.Nil(err)
+			assert.NoError(err)
+			n2, err := NLRIFromSlice(tt.rf, buf1)
+			assert.NoError(err)
 
 			t.Logf("%s", n1)
 			t.Logf("%s", n2)
@@ -237,11 +227,9 @@ func Test_MUPType2SessionTransformedRouteIPv4(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			n1 := NewMUPNLRI(AFI_IP, MUP_ARCH_TYPE_3GPP_5G, MUP_ROUTE_TYPE_TYPE_2_SESSION_TRANSFORMED, tt.in)
 			buf1, err := n1.Serialize()
-			assert.Nil(err)
-			n2, err := NewPrefixFromRouteFamily(RouteFamilyToAfiSafi(RF_MUP_IPv4))
-			assert.Nil(err)
-			err = n2.DecodeFromBytes(buf1)
-			assert.Nil(err)
+			assert.NoError(err)
+			n2, err := NLRIFromSlice(RF_MUP_IPv4, buf1)
+			assert.NoError(err)
 
 			t.Logf("%s", n1)
 			t.Logf("%s", n2)
@@ -290,11 +278,9 @@ func Test_MUPType2SessionTransformedRouteIPv6(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			n1 := NewMUPNLRI(AFI_IP6, MUP_ARCH_TYPE_3GPP_5G, MUP_ROUTE_TYPE_TYPE_2_SESSION_TRANSFORMED, tt.in)
 			buf1, err := n1.Serialize()
-			assert.Nil(err)
-			n2, err := NewPrefixFromRouteFamily(RouteFamilyToAfiSafi(RF_MUP_IPv6))
-			assert.Nil(err)
-			err = n2.DecodeFromBytes(buf1)
-			assert.Nil(err)
+			assert.NoError(err)
+			n2, err := NLRIFromSlice(RF_MUP_IPv6, buf1)
+			assert.NoError(err)
 
 			t.Logf("%s", n1)
 			t.Logf("%s", n2)

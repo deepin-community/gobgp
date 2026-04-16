@@ -3,9 +3,10 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"net/netip"
 
 	"github.com/BurntSushi/toml"
-	"github.com/osrg/gobgp/v3/pkg/config/oc"
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
 )
 
 func main() {
@@ -13,7 +14,7 @@ func main() {
 		Global: oc.Global{
 			Config: oc.GlobalConfig{
 				As:       12332,
-				RouterId: "10.0.0.1",
+				RouterId: netip.MustParseAddr("10.0.0.1"),
 			},
 		},
 		Neighbors: []oc.Neighbor{
@@ -21,7 +22,7 @@ func main() {
 				Config: oc.NeighborConfig{
 					PeerAs:          12333,
 					AuthPassword:    "apple",
-					NeighborAddress: "192.168.177.33",
+					NeighborAddress: netip.MustParseAddr("192.168.177.33"),
 				},
 				AfiSafis: []oc.AfiSafi{
 					{
@@ -36,7 +37,6 @@ func main() {
 					},
 				},
 				ApplyPolicy: oc.ApplyPolicy{
-
 					Config: oc.ApplyPolicyConfig{
 						ImportPolicyList:    []string{"pd1"},
 						DefaultImportPolicy: oc.DEFAULT_POLICY_TYPE_ACCEPT_ROUTE,
@@ -48,7 +48,7 @@ func main() {
 				Config: oc.NeighborConfig{
 					PeerAs:          12334,
 					AuthPassword:    "orange",
-					NeighborAddress: "192.168.177.32",
+					NeighborAddress: netip.MustParseAddr("192.168.177.32"),
 				},
 			},
 
@@ -56,7 +56,7 @@ func main() {
 				Config: oc.NeighborConfig{
 					PeerAs:          12335,
 					AuthPassword:    "grape",
-					NeighborAddress: "192.168.177.34",
+					NeighborAddress: netip.MustParseAddr("192.168.177.34"),
 				},
 			},
 		},
@@ -77,14 +77,14 @@ func main() {
 }
 
 func policy() oc.RoutingPolicy {
-
 	ps := oc.PrefixSet{
 		PrefixSetName: "ps1",
 		PrefixList: []oc.Prefix{
 			{
-				IpPrefix:        "10.3.192.0/21",
+				IpPrefix:        netip.MustParsePrefix("10.3.192.0/21"),
 				MasklengthRange: "21..24",
-			}},
+			},
+		},
 	}
 
 	ns := oc.NeighborSet{
@@ -127,7 +127,6 @@ func policy() oc.RoutingPolicy {
 	s := oc.Statement{
 		Name: "statement1",
 		Conditions: oc.Conditions{
-
 			MatchPrefixSet: oc.MatchPrefixSet{
 				PrefixSet:       "ps1",
 				MatchSetOptions: oc.MATCH_SET_OPTIONS_RESTRICTED_TYPE_ANY,

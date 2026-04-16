@@ -19,8 +19,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/osrg/gobgp/v3/pkg/apiutil"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -29,7 +29,7 @@ func Test_ParsePath(t *testing.T) {
 	buf := "10.0.0.0/24 rt 100:100 med 10 nexthop 10.0.0.1 aigp metric 10 local-pref 100"
 
 	path, err := parsePath(bgp.RF_IPv4_UC, strings.Split(buf, " "))
-	assert.Nil(err)
+	assert.NoError(err)
 	i := 0
 	attrs, _ := apiutil.GetNativePathAttributes(path)
 	for _, a := range attrs {
@@ -39,7 +39,7 @@ func Test_ParsePath(t *testing.T) {
 }
 
 func Test_ParseEvpnPath(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		name string
 		path string
 	}{
@@ -55,7 +55,7 @@ func Test_ParseEvpnPath(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert := assert.New(t)
 			path, err := parsePath(bgp.RF_EVPN, strings.Split(tt.path, " "))
-			assert.Nil(err)
+			assert.NoError(err)
 			i := 0
 			attrs, _ := apiutil.GetNativePathAttributes(path)
 			for _, a := range attrs {
@@ -64,4 +64,87 @@ func Test_ParseEvpnPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_ParseFlowSpecPath(t *testing.T) {
+	tests := []struct {
+		name        string
+		rf          bgp.Family
+		path        string
+		expectedErr bool
+	}{
+		{"FlowSpec Redirect OK: All SRv6 Policy parameters specified", bgp.RF_FS_IPv6_UC, "match destination 2001:db8::/64 then redirect fd00:1::1:0 color 100 prefix 2001:db8:2:2::/64 locator-node-length 24 function-length 16 behavior END_DT6", false},
+		{"FlowSpec Redirect OK: Only color specified", bgp.RF_FS_IPv6_UC, "match destination 2001:db8::/64 then redirect fd00:1::1:0 color 100", false},
+		{"FlowSpec Redirect OK: No color specified", bgp.RF_FS_IPv6_UC, "match destination 2001:db8::/64 then redirect fd00:1::1:0", false},
+		{"FlowSpec Redirect NG: Missing 'color' of SR Policy", bgp.RF_FS_IPv6_UC, "match destination 2001:db8::/64 then redirect fd00:1::1:0 prefix 2001:db8:2:2::/64 locator-node-length 24 function-length 16 behavior END_DT6", true},
+		{"FlowSpec Redirect NG: Missing 'behavior' of SR Policy", bgp.RF_FS_IPv6_UC, "match destination 2001:db8::/64 then redirect fd00:1::1:0 color 100 prefix 2001:db8:2:2::/64 locator-node-length 24 function-length 16", true},
+		{"FlowSpec Redirect NG: Wrong action", bgp.RF_FS_IPv6_UC, "match destination 2001:db8::/64 then accept color 100 prefix 2001:db8:2:2::/64 locator-node-length 24 function-length 16 behavior END_DT6", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			path, err := parsePath(tt.rf, strings.Split(tt.path, " "))
+			if tt.expectedErr {
+				assert.NotNil(err)
+			} else {
+				assert.NoError(err)
+				i := 0
+				attrs, _ := apiutil.GetNativePathAttributes(path)
+				for _, a := range attrs {
+					assert.True(i < int(a.GetType()))
+					i = int(a.GetType())
+				}
+			}
+		})
+	}
+}
+
+func Test_ParseLsLinkPathDelayMetricTLVs(t *testing.T) {
+	assert := assert.New(t)
+
+	args := strings.Split("link protocol 1 identifier 1 local-asn 65000 local-bgp-router-id 1.1.1.1 remote-asn 65001 remote-bgp-router-id 2.2.2.2 unidirectional-link-delay 8516 unidirectional-link-delay-anomalous min-unidirectional-link-delay 8511 max-unidirectional-link-delay 8527 min-max-unidirectional-link-delay-anomalous unidirectional-delay-variation 51", " ")
+	path, err := parsePath(bgp.RF_LS, args)
+	assert.NoError(err)
+	assert.NotNil(path)
+
+	attrs, err := apiutil.GetNativePathAttributes(path)
+	assert.NoError(err)
+	assert.NotEmpty(attrs)
+
+	var lsAttr *bgp.PathAttributeLs
+	for _, a := range attrs {
+		if v, ok := a.(*bgp.PathAttributeLs); ok {
+			lsAttr = v
+			break
+		}
+	}
+
+	if assert.NotNil(lsAttr) {
+		extracted := lsAttr.Extract()
+
+		if assert.NotNil(extracted.Link.UnidirectionalLinkDelay) {
+			assert.Equal(uint32(8516), extracted.Link.UnidirectionalLinkDelay.Delay)
+			assert.True(extracted.Link.UnidirectionalLinkDelay.Flags.Anomalous)
+		}
+
+		if assert.NotNil(extracted.Link.MinMaxUnidirectionalLinkDelay) {
+			assert.Equal(uint32(8511), extracted.Link.MinMaxUnidirectionalLinkDelay.MinDelay)
+			assert.Equal(uint32(8527), extracted.Link.MinMaxUnidirectionalLinkDelay.MaxDelay)
+			assert.True(extracted.Link.MinMaxUnidirectionalLinkDelay.Flags.Anomalous)
+		}
+
+		if assert.NotNil(extracted.Link.UnidirectionalDelayVariation) {
+			assert.Equal(uint32(51), *extracted.Link.UnidirectionalDelayVariation)
+		}
+	}
+}
+
+func Test_ParseLsLinkPathDelayMetricTLVsMinGreaterThanMax(t *testing.T) {
+	assert := assert.New(t)
+
+	args := strings.Split("link protocol 1 identifier 1 local-asn 65000 local-bgp-router-id 1.1.1.1 remote-asn 65001 remote-bgp-router-id 2.2.2.2 min-unidirectional-link-delay 8527 max-unidirectional-link-delay 8511", " ")
+	path, err := parsePath(bgp.RF_LS, args)
+	assert.Error(err)
+	assert.Nil(path)
+	assert.Contains(err.Error(), "min must be <= max")
 }

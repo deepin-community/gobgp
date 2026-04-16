@@ -16,15 +16,17 @@
 package server
 
 import (
-	"net"
+	"log/slog"
+	"math"
+	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/osrg/gobgp/v3/internal/pkg/table"
-	"github.com/osrg/gobgp/v3/pkg/log"
-	"github.com/osrg/gobgp/v3/pkg/zebra"
+	"github.com/osrg/gobgp/v4/internal/pkg/table"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/zebra"
 )
 
 func Test_newPathFromIPRouteMessage(t *testing.T) {
@@ -42,17 +44,17 @@ func Test_newPathFromIPRouteMessage(t *testing.T) {
 			Command: zebra.RouteAdd.ToEach(v, software),
 		}
 		b := &zebra.IPRouteBody{
-			Type:    zebra.RouteType(zebra.RouteStatic),
+			Type:    zebra.RouteStatic,
 			Flags:   flag,
 			Message: message,
-			Safi:    zebra.Safi(zebra.SafiUnicast), // 1, FRR_ZAPI5_SAFI_UNICAST is same
+			Safi:    zebra.SafiUnicast, // 1, FRR_ZAPI5_SAFI_UNICAST is same
 			Prefix: zebra.Prefix{
-				Prefix:    net.ParseIP("192.168.100.0"),
+				Prefix:    netip.MustParseAddr("192.168.100.0"),
 				PrefixLen: uint8(24),
 			},
 			Nexthops: []zebra.Nexthop{
 				{
-					Gate: net.ParseIP("0.0.0.0"),
+					Gate: netip.IPv4Unspecified(),
 				},
 				{
 					Ifindex: uint32(1),
@@ -61,14 +63,14 @@ func Test_newPathFromIPRouteMessage(t *testing.T) {
 			Distance: uint8(0),
 			Metric:   uint32(100),
 			Mtu:      uint32(0),
-			API:      zebra.APIType(zebra.RouteAdd.ToEach(v, software)),
+			API:      zebra.RouteAdd.ToEach(v, software),
 		}
 		m.Header = *h
 		m.Body = b
-		logger := log.NewDefaultLogger()
+		logger := slog.Default()
 		zebra.BackwardIPv6RouteDelete.ToEach(v, software)
 		path := newPathFromIPRouteMessage(logger, m, v, software)
-		pp := table.NewPath(nil, path.GetNlri(), path.IsWithdraw, path.GetPathAttrs(), time.Now(), false)
+		pp := table.NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: path.GetNlri()}, path.IsWithdraw, path.GetPathAttrs(), time.Now(), false)
 		pp.SetIsFromExternal(path.IsFromExternal())
 		assert.Equal("0.0.0.0", pp.GetNexthop().String())
 		assert.Equal("192.168.100.0/24", pp.GetNlri().String())
@@ -82,7 +84,7 @@ func Test_newPathFromIPRouteMessage(t *testing.T) {
 		m.Body = b
 
 		path = newPathFromIPRouteMessage(logger, m, v, software)
-		pp = table.NewPath(nil, path.GetNlri(), path.IsWithdraw, path.GetPathAttrs(), time.Now(), false)
+		pp = table.NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: path.GetNlri()}, path.IsWithdraw, path.GetPathAttrs(), time.Now(), false)
 		pp.SetIsFromExternal(path.IsFromExternal())
 		assert.Equal("0.0.0.0", pp.GetNexthop().String())
 		assert.Equal("192.168.100.0/24", pp.GetNlri().String())
@@ -100,14 +102,14 @@ func Test_newPathFromIPRouteMessage(t *testing.T) {
 		if v < 5 {
 			b.API = zebra.BackwardIPv6RouteAdd.ToEach(v, software)
 		}
-		b.Prefix.Prefix = net.ParseIP("2001:db8:0:f101::")
+		b.Prefix.Prefix = netip.MustParseAddr("2001:db8:0:f101::")
 		b.Prefix.PrefixLen = uint8(64)
-		b.Nexthops = []zebra.Nexthop{{Gate: net.ParseIP("::")}}
+		b.Nexthops = []zebra.Nexthop{{Gate: netip.IPv6Unspecified()}}
 		m.Header = *h
 		m.Body = b
 
 		path = newPathFromIPRouteMessage(logger, m, v, software)
-		pp = table.NewPath(nil, path.GetNlri(), path.IsWithdraw, path.GetPathAttrs(), time.Now(), false)
+		pp = table.NewPath(bgp.RF_IPv6_UC, nil, bgp.PathNLRI{NLRI: path.GetNlri()}, path.IsWithdraw, path.GetPathAttrs(), time.Now(), false)
 		pp.SetIsFromExternal(path.IsFromExternal())
 		assert.Equal("::", pp.GetNexthop().String())
 		assert.Equal("2001:db8:0:f101::/64", pp.GetNlri().String())
@@ -129,11 +131,86 @@ func Test_newPathFromIPRouteMessage(t *testing.T) {
 		m.Body = b
 
 		path = newPathFromIPRouteMessage(logger, m, v, software)
-		pp = table.NewPath(nil, path.GetNlri(), path.IsWithdraw, path.GetPathAttrs(), time.Now(), false)
+		pp = table.NewPath(bgp.RF_IPv6_UC, nil, bgp.PathNLRI{NLRI: path.GetNlri()}, path.IsWithdraw, path.GetPathAttrs(), time.Now(), false)
 		pp.SetIsFromExternal(path.IsFromExternal())
 		assert.Equal("::", pp.GetNexthop().String())
 		assert.Equal("2001:db8:0:f101::/64", pp.GetNlri().String())
 		assert.True(pp.IsFromExternal())
 		assert.True(pp.IsWithdraw)
 	}
+}
+
+func TestApplyToPathList_UnreachableNoMED(t *testing.T) {
+	// Simulates the zebra-nht scenario: a path with no MED and an
+	// unreachable nexthop should get IsNexthopInvalid=true.
+	assert := assert.New(t)
+
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.3.2.0/24"))
+	nh, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("10.3.1.1"))
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE),
+		nh,
+	}
+	path := table.NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+
+	cache := nexthopStateCache{
+		"10.3.1.1": math.MaxUint32, // unreachable
+	}
+
+	updated := cache.applyToPathList([]*table.Path{path})
+	assert.Len(updated, 1)
+	assert.True(updated[0].IsNexthopInvalid)
+	assert.False(updated[0].IsWithdraw)
+
+	// Applying again should produce no updates (idempotent)
+	updated2 := cache.applyToPathList(updated)
+	assert.Len(updated2, 0, "applying to already-invalid path should be a no-op")
+}
+
+func TestApplyToPathList_ReachableSetsMED(t *testing.T) {
+	assert := assert.New(t)
+
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.3.1.0/24"))
+	nh, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("10.3.1.1"))
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE),
+		nh,
+	}
+	path := table.NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+
+	cache := nexthopStateCache{
+		"10.3.1.1": 20, // reachable, metric=20
+	}
+
+	updated := cache.applyToPathList([]*table.Path{path})
+	assert.Len(updated, 1)
+	assert.False(updated[0].IsNexthopInvalid)
+	med, err := updated[0].GetMed()
+	assert.NoError(err)
+	assert.Equal(uint32(20), med)
+
+	// Applying again should be a no-op
+	updated2 := cache.applyToPathList(updated)
+	assert.Len(updated2, 0, "applying same metric should be a no-op")
+}
+
+func TestApplyToPathList_TransitionReachableToUnreachable(t *testing.T) {
+	assert := assert.New(t)
+
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.3.1.0/24"))
+	nh, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr("10.3.1.1"))
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE),
+		bgp.NewPathAttributeMultiExitDisc(20),
+		nh,
+	}
+	path := table.NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, attrs, time.Now(), false)
+
+	cache := nexthopStateCache{
+		"10.3.1.1": math.MaxUint32, // now unreachable
+	}
+
+	updated := cache.applyToPathList([]*table.Path{path})
+	assert.Len(updated, 1)
+	assert.True(updated[0].IsNexthopInvalid)
 }

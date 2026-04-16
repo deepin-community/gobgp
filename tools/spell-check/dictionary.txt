@@ -3,6 +3,7 @@ afisafi
 aggregator
 aigp
 aspath
+apiutil
 bgpd
 bsid
 cidr
@@ -11,6 +12,7 @@ dscp
 ebgp
 enlp
 ethernet
+etree
 evpn
 flowspec
 gobgp
@@ -50,3 +52,5 @@ unicast
 uptime
 vpls
 zapi
+buflen
+mgmt

@@ -1,0 +1,40 @@
+From 8eecb1bd956ad25ac4418f8e9eb6407e81e70f5a Mon Sep 17 00:00:00 2001
+From: Mathias Gibbens <gibmat@debian.org>
+Date: Sun, 5 Apr 2026 15:37:52 +0000
+Subject: [PATCH] gobgpd: Fix printing of help message
+
+Currently, running `gobgpd --help` displays the nicely formatted help
+message, then also logs that string as a parser error and exits with an
+error. Instead, detect when the help message was printed and exit
+cleanly.
+
+Signed-off-by: Mathias Gibbens <gibmat@debian.org>
+---
+ cmd/gobgpd/main.go | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/cmd/gobgpd/main.go b/cmd/gobgpd/main.go
+index 4e19e6f9f..fbcdfc55d 100644
+--- a/cmd/gobgpd/main.go
++++ b/cmd/gobgpd/main.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 	"crypto/tls"
+ 	"crypto/x509"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log/slog"
+@@ -81,6 +82,12 @@ func main() {
+ 	}
+ 	_, err := flags.Parse(&opts)
+ 	if err != nil {
++		if flagsErr, ok := errors.AsType[*flags.Error](err); ok {
++			if flagsErr.Type == flags.ErrHelp {
++				os.Exit(0)
++			}
++		}
++
+ 		logger.Error("Error parsing flags", slog.String("Error", err.Error()))
+ 		os.Exit(1)
+ 	}

@@ -37,13 +37,13 @@ func (t *TLV) Len() int {
 }
 
 func (t *TLV) Serialize(value []byte) ([]byte, error) {
-	if len(value) != int(t.Len()) {
+	if len(value) != t.Len() {
 		return nil, malformedAttrListErr("serialization failed: Prefix SID TLV malformed")
 	}
 	p := 0
 	value[p] = byte(t.Type)
 	p++
-	binary.BigEndian.PutUint16(value[p:p+2], uint16(t.Length))
+	binary.BigEndian.PutUint16(value[p:p+2], t.Length)
 	return value, nil
 }
 
@@ -147,7 +147,7 @@ func (p *PathAttributePrefixSID) String() string {
 	var buf bytes.Buffer
 
 	for _, tlv := range p.TLVs {
-		buf.WriteString(fmt.Sprintf("%s ", tlv.String()))
+		fmt.Fprintf(&buf, "%s ", tlv.String())
 	}
 
 	return fmt.Sprintf("{Prefix SID attributes: %s}", buf.String())
@@ -209,6 +209,9 @@ func (s *SRv6L3ServiceAttribute) DecodeFromBytes(data []byte) error {
 	if err != nil {
 		return err
 	}
+	if s.Length < 1 {
+		return malformedAttrListErr("SRv6L3ServiceAttribute malformed")
+	}
 	stlvs = stlvs[1:] // RESERVED(1)
 
 	for len(stlvs) >= subTLVHdrLen {
@@ -225,12 +228,18 @@ func (s *SRv6L3ServiceAttribute) DecodeFromBytes(data []byte) error {
 				SubSubTLVs: make([]PrefixSIDTLVInterface, 0),
 			}
 		default:
-			data = data[t.Len():]
+			if len(stlvs) < t.Len() {
+				return malformedAttrListErr("SRv6L3ServiceAttribute/SubTLV malformed")
+			}
+			stlvs = stlvs[t.Len():]
 			continue
 		}
 
 		if err := stlv.DecodeFromBytes(stlvs); err != nil {
 			return err
+		}
+		if len(stlvs) < t.Len() {
+			return malformedAttrListErr("SRv6L3ServiceAttribute/SubTLV malformed")
 		}
 		stlvs = stlvs[t.Len():]
 		s.SubTLVs = append(s.SubTLVs, stlv)
@@ -253,7 +262,7 @@ func (s *SRv6L3ServiceAttribute) String() string {
 	var buf bytes.Buffer
 
 	for _, tlv := range s.SubTLVs {
-		buf.WriteString(fmt.Sprintf("%s ", tlv.String()))
+		fmt.Fprintf(&buf, "%s ", tlv.String())
 	}
 
 	return fmt.Sprintf("{SRv6 L3 Service Attribute: %s}", buf.String())
@@ -291,7 +300,7 @@ func (s *SubTLV) Serialize(value []byte) ([]byte, error) {
 	// Extra byte is reserved
 	buf := make([]byte, subTLVHdrLen+len(value))
 	buf[0] = byte(s.Type)
-	binary.BigEndian.PutUint16(buf[1:4], uint16(s.Length))
+	binary.BigEndian.PutUint16(buf[1:4], s.Length)
 	// 4th reserved byte
 	copy(buf[4:], value)
 
@@ -355,9 +364,9 @@ func (s *SRv6InformationSubTLV) Serialize() ([]byte, error) {
 	p := 0
 	copy(buf[p:], s.SID)
 	p += len(s.SID)
-	buf[p] = byte(s.Flags)
+	buf[p] = s.Flags
 	p++
-	binary.BigEndian.PutUint16(buf[p:p+2], uint16(s.EndpointBehavior))
+	binary.BigEndian.PutUint16(buf[p:p+2], s.EndpointBehavior)
 	p += 2
 	// Reserved byte
 	buf[p] = 0x0
@@ -383,9 +392,12 @@ func (s *SRv6InformationSubTLV) DecodeFromBytes(data []byte) error {
 	// 4th reserved byte
 	p := 4
 	s.SID = make([]byte, 16)
+	if len(data) < p+16+1+2+1 {
+		return malformedAttrListErr("decoding failed: Prefix SID TLV malformed")
+	}
 	copy(s.SID, data[p:p+16])
 	p += 16
-	s.Flags = uint8(data[p])
+	s.Flags = data[p]
 	p++
 	s.EndpointBehavior = binary.BigEndian.Uint16(data[p : p+2])
 	p += 2
@@ -434,11 +446,11 @@ func (s *SRv6InformationSubTLV) MarshalJSON() ([]byte, error) {
 
 func (s *SRv6InformationSubTLV) String() string {
 	var buf bytes.Buffer
-	buf.WriteString(fmt.Sprintf("SID: %s ", net.IP(s.SID).To16().String()))
-	buf.WriteString(fmt.Sprintf("Flag: %d ", s.Flags))
-	buf.WriteString(fmt.Sprintf("Endpoint Behavior: %d ", s.EndpointBehavior))
+	fmt.Fprintf(&buf, "SID: %s ", net.IP(s.SID).To16().String())
+	fmt.Fprintf(&buf, "Flag: %d ", s.Flags)
+	fmt.Fprintf(&buf, "Endpoint Behavior: %d ", s.EndpointBehavior)
 	for _, tlv := range s.SubSubTLVs {
-		buf.WriteString(fmt.Sprintf("%s ", tlv.String()))
+		fmt.Fprintf(&buf, "%s ", tlv.String())
 	}
 
 	return fmt.Sprintf("{SRv6 Information Sub TLV: %s}", buf.String())
@@ -481,7 +493,7 @@ func (s *SubSubTLV) Serialize(value []byte) ([]byte, error) {
 	p := 0
 	buf[p] = byte(s.Type)
 	p++
-	binary.BigEndian.PutUint16(buf[p:p+2], uint16(s.Length))
+	binary.BigEndian.PutUint16(buf[p:p+2], s.Length)
 	p += 2
 	copy(buf[p:], value)
 
@@ -495,7 +507,7 @@ func (s *SubSubTLV) DecodeFromBytes(data []byte) ([]byte, error) {
 	s.Type = SubSubTLVType(data[0])
 	s.Length = binary.BigEndian.Uint16(data[1:3])
 
-	if len(data) < s.Len() {
+	if len(data) < s.Len() || s.Len() < prefixSIDtlvHdrLen {
 		return nil, malformedAttrListErr("decoding failed: Prefix SID Sub Sub TLV malformed")
 	}
 
@@ -552,7 +564,7 @@ func (s *SRv6SIDStructureSubSubTLV) Serialize() ([]byte, error) {
 }
 
 func (s *SRv6SIDStructureSubSubTLV) DecodeFromBytes(data []byte) error {
-	if len(data) < subSubTLVHdrLen {
+	if len(data) < 9 {
 		return malformedAttrListErr("decoding failed: Prefix SID Sub Sub TLV malformed")
 	}
 	s.Type = SubSubTLVType(data[0])
@@ -643,6 +655,9 @@ func (s *SRv6ServiceTLV) DecodeFromBytes(data []byte) error {
 	if err != nil {
 		return err
 	}
+	if s.Length < 1 {
+		return malformedAttrListErr("SRv6ServiceTLV malformed")
+	}
 	stlvs = stlvs[1:] // RESERVED(1)
 
 	for len(stlvs) >= subTLVHdrLen {
@@ -659,12 +674,18 @@ func (s *SRv6ServiceTLV) DecodeFromBytes(data []byte) error {
 				SubSubTLVs: make([]PrefixSIDTLVInterface, 0),
 			}
 		default:
-			data = data[t.Len():]
+			if len(stlvs) < t.Len() {
+				return malformedAttrListErr("SRv6ServiceTLV malformed")
+			}
+			stlvs = stlvs[t.Len():]
 			continue
 		}
 
 		if err := stlv.DecodeFromBytes(stlvs); err != nil {
 			return err
+		}
+		if len(stlvs) < t.Len() {
+			return malformedAttrListErr("SRv6ServiceTLV malformed")
 		}
 		stlvs = stlvs[t.Len():]
 		s.SubTLVs = append(s.SubTLVs, stlv)
@@ -687,7 +708,7 @@ func (t *SRv6ServiceTLV) String() string {
 	var buf bytes.Buffer
 
 	for _, tlv := range t.SubTLVs {
-		buf.WriteString(fmt.Sprintf("%s ", tlv.String()))
+		fmt.Fprintf(&buf, "%s ", tlv.String())
 	}
 
 	return fmt.Sprintf("{SRv6 Service TLV: %s}", buf.String())

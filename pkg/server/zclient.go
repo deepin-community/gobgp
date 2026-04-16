@@ -16,18 +16,20 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"math"
-	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/osrg/gobgp/v3/internal/pkg/table"
-	"github.com/osrg/gobgp/v3/pkg/log"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
-	"github.com/osrg/gobgp/v3/pkg/zebra"
+	"github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/internal/pkg/table"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/zebra"
 )
 
 // nexthopStateCache stores a map of nexthop IP to metric value. Especially,
@@ -45,10 +47,13 @@ func (m nexthopStateCache) applyToPathList(paths []*table.Path) []*table.Path {
 			continue
 		}
 		isNexthopInvalid := metric == math.MaxUint32
+		if isNexthopInvalid && path.IsNexthopInvalid {
+			// Path is already correctly marked as invalid; nothing to do.
+			continue
+		}
 		med, err := path.GetMed()
-		if err == nil && med == metric && path.IsNexthopInvalid == isNexthopInvalid {
-			// If the nexthop state of the given path is already up to date,
-			// skips this path.
+		if !isNexthopInvalid && err == nil && med == metric && !path.IsNexthopInvalid {
+			// Path MED already reflects the current nexthop metric; nothing to do.
 			continue
 		}
 		newPath := path.Clone(false)
@@ -56,7 +61,9 @@ func (m nexthopStateCache) applyToPathList(paths []*table.Path) []*table.Path {
 			newPath.IsNexthopInvalid = true
 		} else {
 			newPath.IsNexthopInvalid = false
-			newPath.SetMed(int64(metric), true)
+			if err := newPath.SetMed(int64(metric), true); err != nil {
+				continue
+			}
 		}
 		updated = append(updated, newPath)
 	}
@@ -116,7 +123,7 @@ func filterOutExternalPath(paths []*table.Path) []*table.Path {
 }
 
 func addLabelToNexthop(path *table.Path, z *zebraClient, msgFlags *zebra.MessageFlag, nexthop *zebra.Nexthop) {
-	rf := path.GetRouteFamily()
+	rf := path.GetFamily()
 	if rf == bgp.RF_IPv4_VPN || rf == bgp.RF_IPv6_VPN {
 		z.client.SetLabelFlag(msgFlags, nexthop)
 		switch rf {
@@ -126,7 +133,7 @@ func addLabelToNexthop(path *table.Path, z *zebraClient, msgFlags *zebra.Message
 				nexthop.MplsLabels = append(nexthop.MplsLabels, label)
 			}
 		case bgp.RF_IPv6_VPN:
-			for _, label := range path.GetNlri().(*bgp.LabeledVPNIPv6AddrPrefix).Labels.Labels {
+			for _, label := range path.GetNlri().(*bgp.LabeledVPNIPAddrPrefix).Labels.Labels {
 				nexthop.LabelNum++
 				nexthop.MplsLabels = append(nexthop.MplsLabels, label)
 			}
@@ -143,19 +150,15 @@ func newIPRouteBody(dst []*table.Path, vrfID uint32, z *zebraClient) (body *zebr
 	path := paths[0]
 
 	l := strings.SplitN(path.GetPrefix(), "/", 2)
-	var prefix net.IP
+	var prefix netip.Addr
 	var nexthop zebra.Nexthop
 	nexthops := make([]zebra.Nexthop, 0, len(paths))
 	msgFlags := zebra.MessageNexthop
-	switch path.GetRouteFamily() {
-	case bgp.RF_IPv4_UC:
-		prefix = path.GetNlri().(*bgp.IPAddrPrefix).IPAddrPrefixDefault.Prefix.To4()
-	case bgp.RF_IPv4_VPN:
-		prefix = path.GetNlri().(*bgp.LabeledVPNIPAddrPrefix).IPAddrPrefixDefault.Prefix.To4()
-	case bgp.RF_IPv6_UC:
-		prefix = path.GetNlri().(*bgp.IPv6AddrPrefix).IPAddrPrefixDefault.Prefix.To16()
-	case bgp.RF_IPv6_VPN:
-		prefix = path.GetNlri().(*bgp.LabeledVPNIPv6AddrPrefix).IPAddrPrefixDefault.Prefix.To16()
+	switch path.GetFamily() {
+	case bgp.RF_IPv4_UC, bgp.RF_IPv6_UC:
+		prefix = path.GetNlri().(*bgp.IPAddrPrefix).Prefix.Addr()
+	case bgp.RF_IPv4_VPN, bgp.RF_IPv6_VPN:
+		prefix = path.GetNlri().(*bgp.LabeledVPNIPAddrPrefix).Prefix.Addr()
 	default:
 		return nil, false
 	}
@@ -208,7 +211,7 @@ func newNexthopRegisterBody(paths []*table.Path, nexthopCache nexthopStateCache)
 	}
 	path := paths[0]
 
-	family := path.GetRouteFamily()
+	family := path.GetFamily()
 	nexthops := make([]*zebra.RegisteredNexthop, 0, len(paths))
 	for _, p := range paths {
 		nexthop := p.GetNexthop()
@@ -217,12 +220,12 @@ func newNexthopRegisterBody(paths []*table.Path, nexthopCache nexthopStateCache)
 		case bgp.RF_IPv4_UC, bgp.RF_IPv4_VPN:
 			nh = &zebra.RegisteredNexthop{
 				Family: syscall.AF_INET,
-				Prefix: nexthop.To4(),
+				Prefix: nexthop,
 			}
 		case bgp.RF_IPv6_UC, bgp.RF_IPv6_VPN:
 			nh = &zebra.RegisteredNexthop{
 				Family: syscall.AF_INET6,
-				Prefix: nexthop.To16(),
+				Prefix: nexthop,
 			}
 		default:
 			continue
@@ -241,7 +244,7 @@ func newNexthopRegisterBody(paths []*table.Path, nexthopCache nexthopStateCache)
 	}
 }
 
-func newNexthopUnregisterBody(family uint16, prefix net.IP) *zebra.NexthopRegisterBody {
+func newNexthopUnregisterBody(family uint16, prefix netip.Addr) *zebra.NexthopRegisterBody {
 	return &zebra.NexthopRegisterBody{
 		Nexthops: []*zebra.RegisteredNexthop{{
 			Family: family,
@@ -250,57 +253,59 @@ func newNexthopUnregisterBody(family uint16, prefix net.IP) *zebra.NexthopRegist
 	}
 }
 
-func newPathFromIPRouteMessage(logger log.Logger, m *zebra.Message, version uint8, software zebra.Software) *table.Path {
+func newPathFromIPRouteMessage(logger *slog.Logger, m *zebra.Message, version uint8, software zebra.Software) *table.Path {
 	header := m.Header
 	body := m.Body.(*zebra.IPRouteBody)
-	family := body.RouteFamily(logger, version, software)
+	family := body.Family(logger, version, software)
 	isWithdraw := body.IsWithdraw(version, software)
 
-	var nlri bgp.AddrPrefixInterface
+	var nlri bgp.NLRI
 	pattr := make([]bgp.PathAttributeInterface, 0)
 	origin := bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_IGP)
 	pattr = append(pattr, origin)
 
 	logger.Debug("create path from ip route message",
-		log.Fields{
-			"Topic":        "Zebra",
-			"RouteType":    body.Type.String(),
-			"Flag":         body.Flags.String(version, software),
-			"Message":      body.Message,
-			"Family":       body.Prefix.Family,
-			"Prefix":       body.Prefix.Prefix,
-			"PrefixLength": body.Prefix.PrefixLen,
-			"Nexthop":      body.Nexthops,
-			"Metric":       body.Metric,
-			"Distance":     body.Distance,
-			"Mtu":          body.Mtu,
-			"api":          header.Command.String()})
+		slog.String("Topic", "Zebra"),
+		slog.String("RouteType", body.Type.String()),
+		slog.String("Flag", body.Flags.String(version, software)),
+		slog.Any("Message", body.Message),
+		slog.Int("Family", int(body.Prefix.Family)),
+		slog.String("Prefix", body.Prefix.Prefix.String()),
+		slog.Int("PrefixLength", int(body.Prefix.PrefixLen)),
+		slog.Any("Nexthop", body.Nexthops),
+		slog.Uint64("Metric", uint64(body.Metric)),
+		slog.Int("Distance", int(body.Distance)),
+		slog.Uint64("Mtu", uint64(body.Mtu)),
+		slog.String("api", header.Command.String()),
+	)
 
+	nlri, _ = bgp.NewIPAddrPrefix(netip.MustParsePrefix(fmt.Sprintf("%s/%d", body.Prefix.Prefix.String(), body.Prefix.PrefixLen)))
 	switch family {
 	case bgp.RF_IPv4_UC:
-		nlri = bgp.NewIPAddrPrefix(body.Prefix.PrefixLen, body.Prefix.Prefix.String())
 		if len(body.Nexthops) > 0 {
-			pattr = append(pattr, bgp.NewPathAttributeNextHop(body.Nexthops[0].Gate.String()))
+			pa, _ := bgp.NewPathAttributeNextHop(netip.MustParseAddr(body.Nexthops[0].Gate.String()))
+			pattr = append(pattr, pa)
 		}
 	case bgp.RF_IPv6_UC:
-		nlri = bgp.NewIPv6AddrPrefix(body.Prefix.PrefixLen, body.Prefix.Prefix.String())
-		nexthop := ""
 		if len(body.Nexthops) > 0 {
-			nexthop = body.Nexthops[0].Gate.String()
+			nexthop, err := netip.ParseAddr(body.Nexthops[0].Gate.String())
+			if err == nil {
+				attr, _ := bgp.NewPathAttributeMpReachNLRI(family, []bgp.PathNLRI{{NLRI: nlri}}, nexthop)
+				pattr = append(pattr, attr)
+			}
 		}
-		pattr = append(pattr, bgp.NewPathAttributeMpReachNLRI(nexthop, []bgp.AddrPrefixInterface{nlri}))
 	default:
 		logger.Error("unsupport address family",
-			log.Fields{
-				"Topic":  "Zebra",
-				"Family": family})
+			slog.String("Topic", "Zebra"),
+			slog.Int("Family", int(family)),
+		)
 		return nil
 	}
 
 	med := bgp.NewPathAttributeMultiExitDisc(body.Metric)
 	pattr = append(pattr, med)
 
-	path := table.NewPath(nil, nlri, isWithdraw, pattr, time.Now(), false)
+	path := table.NewPath(family, nil, bgp.PathNLRI{NLRI: nlri}, isWithdraw, pattr, time.Now(), false)
 	path.SetIsFromExternal(true)
 	return path
 }
@@ -308,42 +313,40 @@ func newPathFromIPRouteMessage(logger log.Logger, m *zebra.Message, version uint
 type mplsLabelParameter struct {
 	rangeSize     uint32
 	maps          map[uint64]*table.Bitmap
-	unassignedVrf []*table.Vrf //Vrfs which are not assigned MPLS label
+	unassignedVrf []*table.Vrf // Vrfs which are not assigned MPLS label
 }
 
 type zebraClient struct {
 	client       *zebra.Client
 	server       *BgpServer
 	nexthopCache nexthopStateCache
-	pathVrfMap   map[*table.Path]uint32 //vpn paths and nexthop vpn id
+	pathVrfMap   map[*table.Path]uint32 // vpn paths and nexthop vpn id
 	mplsLabel    mplsLabelParameter
 	dead         chan struct{}
 }
 
 func (z *zebraClient) getPathListWithNexthopUpdate(body *zebra.NexthopUpdateBody) []*table.Path {
-	rib := &table.TableManager{
-		Tables: make(map[bgp.RouteFamily]*table.Table),
-	}
+	rib := table.NewTableManager(z.server.logger, nil)
 
-	var rfList []bgp.RouteFamily
+	var rfList []bgp.Family
 	switch body.Prefix.Family {
 	case syscall.AF_INET:
-		rfList = []bgp.RouteFamily{bgp.RF_IPv4_UC, bgp.RF_IPv4_VPN}
+		rfList = []bgp.Family{bgp.RF_IPv4_UC, bgp.RF_IPv4_VPN}
 	case syscall.AF_INET6:
-		rfList = []bgp.RouteFamily{bgp.RF_IPv6_UC, bgp.RF_IPv6_VPN}
+		rfList = []bgp.Family{bgp.RF_IPv6_UC, bgp.RF_IPv6_VPN}
 	}
 
 	for _, rf := range rfList {
 		tbl, _, err := z.server.getRib("", rf, nil)
 		if err != nil {
 			z.server.logger.Error("failed to get global rib",
-				log.Fields{
-					"Topic":  "Zebra",
-					"Family": rf.String(),
-					"Error":  err})
+				slog.String("Topic", "Zebra"),
+				slog.String("Family", rf.String()),
+				slog.String("Error", err.Error()),
+			)
 			continue
 		}
-		rib.Tables[rf] = tbl
+		rib.SetTable(rf, tbl)
 	}
 
 	return rib.GetPathListWithNexthop(table.GLOBAL_RIB_NAME, rfList, body.Prefix.Prefix)
@@ -354,17 +357,18 @@ func (z *zebraClient) updatePathByNexthopCache(paths []*table.Path) {
 	if len(paths) > 0 {
 		if err := z.server.updatePath("", paths); err != nil {
 			z.server.logger.Error("failed to update nexthop reachability",
-				log.Fields{
-					"Topic":    "Zebra",
-					"PathList": paths})
+				slog.String("Topic", "Zebra"),
+				slog.Any("PathList", paths),
+				slog.String("Error", err.Error()),
+			)
 		}
 	}
 }
 
 func (z *zebraClient) loop() {
-	w := z.server.watch([]watchOption{
-		watchBestPath(true),
-		watchPostUpdate(true, "", ""),
+	w := z.server.watch([]WatchOption{
+		WatchBestPath(true),
+		WatchPostUpdate(true, "", ""),
 	}...)
 	defer w.Stop()
 
@@ -379,12 +383,12 @@ func (z *zebraClient) loop() {
 			switch body := msg.Body.(type) {
 			case *zebra.IPRouteBody:
 				if path := newPathFromIPRouteMessage(z.server.logger, msg, z.client.Version, z.client.Software); path != nil {
-					if err := z.server.addPathList("", []*table.Path{path}); err != nil {
+					if err := z.server.addPathStream("", []*table.Path{path}); err != nil {
 						z.server.logger.Error("failed to add path from zebra",
-							log.Fields{
-								"Topic": "Zebra",
-								"Path":  path,
-								"Error": err})
+							slog.String("Topic", "Zebra"),
+							slog.Any("Path", path),
+							slog.String("Error", err.Error()),
+						)
 					}
 				}
 			case *zebra.NexthopUpdateBody:
@@ -395,24 +399,30 @@ func (z *zebraClient) loop() {
 				if len(paths) == 0 {
 					// If there is no path bound for the given nexthop, send
 					// NEXTHOP_UNREGISTER message.
-					z.client.SendNexthopRegister(msg.Header.VrfID, newNexthopUnregisterBody(uint16(body.Prefix.Family), body.Prefix.Prefix), true)
+					err := z.client.SendNexthopRegister(msg.Header.VrfID, newNexthopUnregisterBody(uint16(body.Prefix.Family), body.Prefix.Prefix), true)
+					if err != nil {
+						z.server.logger.Error("failed to send nexthop unregister",
+							slog.String("Topic", "Zebra"),
+							slog.String("Error", err.Error()),
+						)
+					}
 					delete(z.nexthopCache, body.Prefix.Prefix.String())
 				}
 				z.updatePathByNexthopCache(paths)
 			case *zebra.GetLabelChunkBody:
 				z.server.logger.Debug("zebra GetLabelChunkBody is received",
-					log.Fields{
-						"Topic": "Zebra",
-						"Start": body.Start,
-						"End":   body.End})
+					slog.String("Topic", "Zebra"),
+					slog.Int("Start", int(body.Start)),
+					slog.Int("End", int(body.End)),
+				)
 				startEnd := uint64(body.Start)<<32 | uint64(body.End)
 				z.mplsLabel.maps[startEnd] = table.NewBitmap(int(body.End - body.Start + 1))
 				for _, vrf := range z.mplsLabel.unassignedVrf {
 					if err := z.assignAndSendVrfMplsLabel(vrf); err != nil {
 						z.server.logger.Error("zebra failed to assign and send vrf mpls label",
-							log.Fields{
-								"Topic": "Zebra",
-								"Error": err})
+							slog.String("Topic", "Zebra"),
+							slog.String("Vrf", vrf.Name),
+							slog.String("Error", err.Error()))
 					}
 				}
 				z.mplsLabel.unassignedVrf = nil
@@ -425,10 +435,24 @@ func (z *zebraClient) loop() {
 						z.updatePathByNexthopCache(paths)
 						for i := range msg.Vrf {
 							if body, isWithdraw := newIPRouteBody(paths, i, z); body != nil {
-								z.client.SendIPRoute(i, body, isWithdraw)
+								err := z.client.SendIPRoute(i, body, isWithdraw)
+								if err != nil {
+									z.server.logger.Error("failed to send ip route",
+										slog.String("Topic", "Zebra"),
+										slog.String("Error", err.Error()),
+									)
+									continue
+								}
 							}
 							if body := newNexthopRegisterBody(paths, z.nexthopCache); body != nil {
-								z.client.SendNexthopRegister(i, body, false)
+								err := z.client.SendNexthopRegister(i, body, false)
+								if err != nil {
+									z.server.logger.Error("failed to send nexthop register",
+										slog.String("Topic", "Zebra"),
+										slog.String("Error", err.Error()),
+									)
+									continue
+								}
 							}
 						}
 					}
@@ -439,11 +463,22 @@ func (z *zebraClient) loop() {
 							if body, isWithdraw := newIPRouteBody([]*table.Path{path}, i, z); body != nil {
 								err := z.client.SendIPRoute(i, body, isWithdraw)
 								if err != nil {
+									z.server.logger.Error("failed to send ip route",
+										slog.String("Topic", "Zebra"),
+										slog.String("Error", err.Error()),
+									)
 									continue
 								}
 							}
 							if body := newNexthopRegisterBody([]*table.Path{path}, z.nexthopCache); body != nil {
-								z.client.SendNexthopRegister(i, body, false)
+								err := z.client.SendNexthopRegister(i, body, false)
+								if err != nil {
+									z.server.logger.Error("failed to send nexthop register",
+										slog.String("Topic", "Zebra"),
+										slog.String("Error", err.Error()),
+									)
+									continue
+								}
 							}
 						}
 					}
@@ -451,12 +486,23 @@ func (z *zebraClient) loop() {
 			case *watchEventUpdate:
 				if body := newNexthopRegisterBody(msg.PathList, z.nexthopCache); body != nil {
 					vrfID := uint32(0)
-					for _, vrf := range z.server.listVrf() {
-						if vrf.Name == msg.Neighbor.Config.Vrf {
-							vrfID = uint32(vrf.Id)
-						}
+					err := z.server.ListVrf(context.Background(), &api.ListVrfRequest{Name: msg.Neighbor.Config.Vrf}, func(v *api.Vrf) {
+						vrfID = v.Id
+					})
+					if err != nil {
+						z.server.logger.Error("failed to get vrf id",
+							slog.String("Topic", "Zebra"),
+							slog.String("Error", err.Error()),
+						)
 					}
-					z.client.SendNexthopRegister(vrfID, body, false)
+					err = z.client.SendNexthopRegister(vrfID, body, false)
+					if err != nil {
+						z.server.logger.Error("failed to send nexthop register",
+							slog.String("Topic", "Zebra"),
+							slog.String("Error", err.Error()),
+						)
+						continue
+					}
 				}
 			}
 		}
@@ -488,23 +534,21 @@ func newZebraClient(s *BgpServer, url string, protos []string, version uint8, nh
 		}
 		// Retry with another Zebra message version
 		s.logger.Warn("cannot connect to Zebra with message version",
-			log.Fields{
-				"Topic":   "Zebra",
-				"Version": ver})
+			slog.String("Topic", "Zebra"),
+			slog.Int("Version", int(ver)))
 		if elem < len(zapivers)-1 {
 			s.logger.Warn("going to retry another version",
-				log.Fields{
-					"Topic":   "Zebra",
-					"Version": zapivers[elem+1]})
+				slog.String("Topic", "Zebra"),
+				slog.Int("Version", int(zapivers[elem+1])))
 		}
 	}
 	if cli == nil || err != nil {
 		return nil, err
 	}
 	s.logger.Info("success to connect to Zebra",
-		log.Fields{
-			"Topic":   "Zebra",
-			"Version": usingVersion})
+		slog.String("Topic", "Zebra"),
+		slog.Int("Version", int(usingVersion)),
+	)
 
 	// Note: HELLO/ROUTER_ID_ADD messages are automatically sent to negotiate
 	// the Zebra message version in zebra.NewClient().
